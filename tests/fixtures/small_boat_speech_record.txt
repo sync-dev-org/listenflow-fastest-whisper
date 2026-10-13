@@ -1,0 +1,83 @@
+Synthetic test speech record
+
+Model and runtime
+-----------------
+
+Model: Qwen3-TTS-12Hz-1.7B-CustomVoice (Apache-2.0)
+https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+
+GGUF Q8_0 weights (Apache-2.0):
+https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF
+
+- Talker: qwen-talker-1.7b-customvoice-Q8_0.gguf
+  SHA-256: cab2cff67a0a557310febe558dc83076b28ed790e491867eb2751759f4cd89fa
+- Codec: qwen-tokenizer-12hz-Q8_0.gguf
+  SHA-256: 1883beeed99348fc35e23dd225e9082f93f6f8c109330a33d935baa8acdbfd94
+
+Runtime: qwentts.cpp with ggml (both MIT), using the CUDA backend.
+Voice: built-in speaker Aiden. The synthesis used this built-in voice
+without a reference audio input.
+Settings: language="en", voice="Aiden", greedy decoding without sampling,
+seed 7. Two synthesis runs with these settings produced identical bytes.
+
+Spoken text
+-----------
+
+Every morning the small boat leaves the harbor before sunrise. The crew
+checks the nets, counts the floats, and writes the weather in a notebook.
+By noon they return with fresh fish for the market.
+
+Processing and conversion
+-------------------------
+
+The float32 synthesis output was converted to 16-bit samples with
+round(clip(x, -1, 1) * 32767). No volume normalization, silence trimming,
+or noise removal was applied. The source WAV is 24 kHz, mono, 16-bit PCM,
+11.68 seconds long:
+SHA-256: 5b99d9424e03c56e358101e03fd82e442fc0fa42d39df5b1db6e48b7966f60ab
+
+The full utterance was resampled to 16 kHz mono signed 16-bit little-endian
+(s16le) PCM WAVE using FFmpeg 8.0.1-3ubuntu2, libswresample 6.1.100:
+
+ffmpeg -y -hide_banner -loglevel error -i fixture-small-boat.wav \
+  -map_metadata -1 -ac 1 -ar 16000 -c:a pcm_s16le \
+  -fflags +bitexact -flags:a +bitexact -f wav \
+  small_boat_16khz_mono_s16le.wav
+
+The resulting asset contains 186,880 samples, 11.68 seconds, with a 44-byte WAVE header
+(373,804 bytes in total):
+SHA-256: f80e9a97d1294af40e1f6076454437825388d4ceff87542abd1127bf1ae587bb
+
+tests/fixtures/generate_synthetic_speech.sh verifies the source WAV
+checksums and reproduces this conversion from the repository root.
+
+License
+-------
+
+This generated audio is distributed under the MIT license as part of
+listenflow-faster-whisper, together with its code. The synthesis model
+and GGUF weights retain their Apache-2.0 license as external synthesis
+inputs. The distribution contains the generated speech and this record.
+
+Reuse in listenflow-fastest-whisper
+----------------------------------
+
+Copied from repository sync-dev-org/listenflow-faster-whisper at commit
+d7c6087edd7b871bebda8d245a71a5f22b01cdc3:
+- tests/fixtures/small_boat_16khz_mono_s16le.wav
+- tests/fixtures/small_boat_speech_record.txt
+- tests/fixtures/generate_synthetic_speech.sh
+
+listenflow-fastest-whisper also distributes the copied synthetic audio,
+this record, and the conversion script under MIT.
+
+The conversion script in this repository accepts only the small-boat
+24 kHz source WAV. The related repository's script also converted a separate
+warmup recording into its package; that conversion is omitted here.
+From this repository's root, reproduce the fixture with:
+
+bash tests/fixtures/generate_synthetic_speech.sh fixture-small-boat.wav
+
+The script checks the source WAV SHA-256 and retains the original FFmpeg
+bit-exact conversion options. The original 24 kHz WAV is an external input
+and is not included in this repository.

@@ -1,0 +1,10 @@
+dist/
+build/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/
+src/listenflow/fastest_whisper/_version.py
+.nf/tmp/
+.nf/logs/

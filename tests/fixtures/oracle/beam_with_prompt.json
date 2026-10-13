@@ -1,0 +1,99 @@
+{
+  "implementation": "openai-whisper==20250625",
+  "checkpoint_sha256": "e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb",
+  "decode": {
+    "call": "whisper.decode(model, mel, options)",
+    "language": "en",
+    "task": "transcribe",
+    "temperature": 0.0,
+    "beam_size": 2,
+    "best_of": null,
+    "without_timestamps": true,
+    "suppress_tokens": "-1",
+    "suppress_blank": true,
+    "fp16": false,
+    "sample_len": null,
+    "prompt": [
+      264
+    ],
+    "prefix": null,
+    "initial_prompt": "the"
+  },
+  "fixtures": {
+    "small_boat_16khz_mono_s16le": {
+      "text": "Every morning, the small boat leaves the harbor before sunrise. The crew checks the nets, counts the floats, and writes the weather in a notebook. By noon, they return with fresh fish for the market.",
+      "tokens_without_eot": [
+        2048,
+        2446,
+        11,
+        264,
+        1359,
+        6582,
+        5510,
+        264,
+        36947,
+        949,
+        33675,
+        13,
+        440,
+        7260,
+        13834,
+        264,
+        36170,
+        11,
+        14893,
+        264,
+        37878,
+        11,
+        293,
+        13657,
+        264,
+        5503,
+        294,
+        257,
+        21060,
+        13,
+        3146,
+        24040,
+        11,
+        436,
+        2736,
+        365,
+        4451,
+        3506,
+        337,
+        264,
+        2142,
+        13
+      ],
+      "eot": 50257,
+      "audio_sha256": "f80e9a97d1294af40e1f6076454437825388d4ceff87542abd1127bf1ae587bb",
+      "initial_tokens": [
+        50362,
+        264,
+        50258,
+        50259,
+        50360,
+        50364
+      ]
+    },
+    "silence_16khz_mono_s16le": {
+      "text": "Thank you.",
+      "tokens_without_eot": [
+        1044,
+        291,
+        13
+      ],
+      "eot": 50257,
+      "audio_sha256": "643f8a8dc8bd9c19225afffad2becfec5426180b3749cb208abdf1a6c8354efc",
+      "initial_tokens": [
+        50362,
+        264,
+        50258,
+        50259,
+        50360,
+        50364
+      ]
+    }
+  }
+}

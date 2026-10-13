@@ -1,0 +1,103 @@
+[project]
+name = "listenflow-fastest-whisper"
+dynamic = ["version"]
+description = "Whisper-family TensorRT inference for listenflow"
+readme = "README.md"
+authors = [{ name = "minamik", email = "mia@sync.dev" }]
+license = "MIT"
+requires-python = ">=3.12,<3.14"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "cuda-python>=13.0",
+    "listenflow>=0.17.6",
+    "numpy>=2.0",
+    "safetensors>=0.4",
+    "tensoracle==0.3.1",
+    "tensorrt-cu13>=11.0",
+    "tokenizers>=0.22",
+]
+
+[project.urls]
+Repository = "https://github.com/sync-dev-org/listenflow-fastest-whisper"
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0.dev0"
+
+[tool.hatch.version.raw-options]
+root = "."
+relative_to = "pyproject.toml"
+version_scheme = "only-version"
+local_scheme = "no-local-version"
+tag_regex = "^v(?P<version>[^/]+)$"
+git_describe_command = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--exact-match",
+    "--match",
+    "v*",
+]
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/listenflow/fastest_whisper/_version.py"
+
+[tool.hatch.build]
+dev-mode-dirs = ["src"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src/listenflow/fastest_whisper", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/listenflow/fastest_whisper"]
+sources = ["src"]
+
+[dependency-groups]
+dev = ["noren==0.3.0", "pytest>=8.0", "ruff>=0.8"]
+oracle = ["openai-whisper==20250625", "torch>=2.0"]
+evaluation = [
+    "ctranslate2",
+    "faster-whisper==1.2.1",
+    "jiwer",
+    "openai-whisper==20250625",
+    "soundfile",
+    "torch>=2.0",
+    "transformers",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+markers = [
+    "gpu: opt-in tests requiring a CUDA GPU and local checkpoint",
+    "req(id): ID of the adopted spec item in .nf/docs/spec.md",
+]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests", "scripts"]
+extend-exclude = ["src/listenflow/fastest_whisper/_version.py"]
