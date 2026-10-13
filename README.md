@@ -192,6 +192,25 @@ or host crash can prevent cleanup; remove that run's directory manually once its
 processes have stopped. Concurrent runs use separate directories and leave each
 other's files alone.
 
+Plan disk and memory per GPU test file from the figures below, measured with one
+file per process on an RTX PRO 4000 Blackwell (sm120) with TensorRT 11.4. Disk is
+the peak size of the run's temporary directory. Memory is the cgroup peak, which
+includes page cache; every file also passes with a 16 GiB memory limit and no swap.
+`tests/test_engine_gpu.py` holds two engine caches at once: the module's shared
+cache and the empty cache in which the cache reuse and corruption check starts.
+
+| file | disk (GiB) | memory (GiB) | duration on sm120 (min) |
+|---|---:|---:|---:|
+| `tests/test_gpu_mel.py` | < 0.1 | 2.1 | < 1 |
+| `tests/test_fp16_gpu.py` | 8.7 | 17.6 | 7 |
+| `tests/test_bucket_graphs_gpu.py` | 2.9 | 9.6 | 3 |
+| `tests/test_fp32_gpu.py` | 5.8 | 17.3 | 3 |
+| `tests/test_engine_gpu.py` | 17.3 | 22.8 | 17 |
+
+Engine builds are slower on older generations. On an RTX A6000 (sm86),
+`tests/test_fp16_gpu.py` took 34 minutes, and the cache reuse and corruption check
+alone took 38 minutes.
+
 Outside pytest, the numerical comparison entries store encoder and decoder engines
 under `$XDG_CACHE_HOME/tensoracle/` (or `~/.cache/tensoracle/` when unset) and rebuild
 them on every model construction. Set `XDG_CACHE_HOME` to a directory on disk
