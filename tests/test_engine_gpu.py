@@ -32,6 +32,8 @@ from listenflow.fastest_whisper import (
 from listenflow.fastest_whisper._engine import _cuda_device_info
 
 FIXTURES = Path(__file__).parent / "fixtures"
+# A fresh TensorRT build takes several minutes on sm86; the limit only stops a hung process.
+PREPARE_TIMEOUT_SECONDS = 1800
 
 
 @pytest.fixture(scope="module")
@@ -326,7 +328,7 @@ asyncio.run(engine.prepare())
             [sys.executable, "-c", code, str(gpu), "1" if force_rebuild else "0", precision],
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=PREPARE_TIMEOUT_SECONDS,
             check=False,
         )
 
