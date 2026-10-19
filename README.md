@@ -24,6 +24,11 @@ pip install listenflow-fastest-whisper
 The package installs listenflow core (`listenflow>=0.17.6`) and tensoracle from
 PyPI as normal dependencies.
 
+The Linux wheel includes the native fc1 plugin and its sm86, sm89, and sm120
+cubins. Runtime installation does not require a TensorRT SDK, Triton, or the
+tensoracle producer. Source development requires the independent native build
+described in [the C++ build guide](https://github.com/sync-dev-org/listenflow-fastest-whisper/blob/main/cpp/README.md).
+
 ## Use the engine
 
 Import this module explicitly with `import listenflow.fastest_whisper` or
@@ -145,24 +150,28 @@ windowing as `transcribe_long_fp32` and yields one `Final` per text segment.
 
 tensoracle stores the mel, encoder, and decoder under `$XDG_CACHE_HOME/tensoracle/`, or
 `~/.cache/tensoracle/` when `XDG_CACHE_HOME` is unset. The constructor has no cache
-path argument. A corrupt or incompatible cached engine stops `prepare()` with its
-`EnvironmentUnavailableError`, the file path, the tensoracle error as its cause, and
-an instruction to construct a new instance
-with `force_rebuild=True`. The engine never rebuilds a bad cache entry implicitly.
+path argument. When a saved engine is corrupt or its build conditions no longer
+match, `prepare()` automatically rebuilds that engine and continues. There is no
+caller setting for rebuilding engines. If rebuilding fails or the rebuilt engine
+cannot be opened, `prepare()` raises `EnvironmentUnavailableError` and preserves the
+underlying error in `__cause__`.
 
 ## Versioning
 
-Release versions come from exact `vX.Y.Z` git tags through hatch-vcs, as configured
-in `[tool.hatch.version]` in
-[pyproject.toml](https://github.com/sync-dev-org/listenflow-fastest-whisper/blob/main/pyproject.toml).
+Release versions come from exact `vX.Y.Z` git tags through setuptools-scm, as configured
+in `[tool.setuptools_scm]` in
+[python/pyproject.toml](https://github.com/sync-dev-org/listenflow-fastest-whisper/blob/main/python/pyproject.toml).
 A checkout without a matching release tag uses the fallback version `0.0.0.dev0`.
 Release versions are published on PyPI.
 
 ## Development
 
-Use Python `>=3.12,<3.14` and [uv](https://docs.astral.sh/uv/). From this checkout:
+Use Python `>=3.12,<3.14` and [uv](https://docs.astral.sh/uv/). The Python project,
+tests, and development scripts live in `python/`, with one environment at
+`python/.venv`. Run the following commands from the repository root:
 
 ```sh
+cd python
 uv sync --group dev --group evaluation
 uv lock --check
 uv run --group dev --group evaluation pytest
@@ -170,15 +179,26 @@ uv run --group dev ruff check
 uv run --group dev ruff format --check
 ```
 
+Run the remaining Python commands below from `python/`. The standalone C++ project
+in `cpp/` uses the host's CMake and Ninja and does not discover Python or nanobind.
+The Python project's README and license are symlinks to the repository's originals;
+source distributions include their contents as regular files.
+
 The evaluation group supplies the CPU libraries used by the reference and scoring
 tests. The ordinary test suite runs without a sibling checkout, checkpoint, or GPU.
-The `gpu` tests skip unless both `LFFW_USE_GPU=1` and `LFFW_CHECKPOINT_DIR` point to a
-usable local Hugging Face checkpoint. Before using a shared GPU, coordinate its use
+Distribution and native build tests need the verified build inputs described in
+the C++ guide. Release wheels use the pinned container and ELF checks in
+[the release build procedure](https://github.com/sync-dev-org/listenflow-fastest-whisper/blob/main/cpp/RELEASE.md).
+The model's `gpu` tests require `LFFW_USE_GPU=1` and `LFFW_CHECKPOINT_DIR` pointing
+to a usable local Hugging Face checkpoint. For cubin production and the standalone
+native plugin build, see [the C++ development guide](https://github.com/sync-dev-org/listenflow-fastest-whisper/blob/main/cpp/README.md). Its small GPU
+tests require a verified TensorRT SDK and `LFFW_USE_GPU=1`, without a Whisper
+checkpoint. Before using a shared GPU, coordinate its use
 with the host's shared-resource owner. Run GPU comparisons serially. Use a directory
 on disk for the checkout; cache checks create several GiB of engine files. GPU
 tests automatically put pytest temporary directories and `XDG_CACHE_HOME` in a
-unique directory under `.nf/tmp/pytest-gpu/`. An explicit `--basetemp` places that
-directory under the supplied base instead. CPU tests retain their usual temporary
+unique directory under the repository root's `.nf/tmp/pytest-gpu/`. An explicit
+`--basetemp` places that directory under the supplied base instead. CPU tests retain their usual temporary
 directories and cache environment.
 
 ```sh
@@ -196,19 +216,19 @@ Plan disk and memory per GPU test file from the figures below, measured with one
 file per process on an RTX PRO 4000 Blackwell (sm120) with TensorRT 11.4. Disk is
 the peak size of the run's temporary directory. Memory is the cgroup peak, which
 includes page cache; every file also passes with a 16 GiB memory limit and no swap.
-`tests/test_engine_gpu.py` holds two engine caches at once: the module's shared
+`python/tests/test_engine_gpu.py` holds two engine caches at once: the module's shared
 cache and the empty cache in which the cache reuse and corruption check starts.
 
 | file | disk (GiB) | memory (GiB) | duration on sm120 (min) |
 |---|---:|---:|---:|
-| `tests/test_gpu_mel.py` | < 0.1 | 2.1 | < 1 |
-| `tests/test_fp16_gpu.py` | 8.7 | 17.6 | 7 |
-| `tests/test_bucket_graphs_gpu.py` | 2.9 | 9.6 | 3 |
-| `tests/test_fp32_gpu.py` | 5.8 | 17.3 | 3 |
-| `tests/test_engine_gpu.py` | 17.3 | 22.8 | 17 |
+| `python/tests/test_gpu_mel.py` | < 0.1 | 2.1 | < 1 |
+| `python/tests/test_fp16_gpu.py` | 8.7 | 17.6 | 7 |
+| `python/tests/test_bucket_graphs_gpu.py` | 2.9 | 9.6 | 3 |
+| `python/tests/test_fp32_gpu.py` | 5.8 | 17.3 | 3 |
+| `python/tests/test_engine_gpu.py` | 17.3 | 22.8 | 17 |
 
 Engine builds are slower on older generations. On an RTX A6000 (sm86),
-`tests/test_fp16_gpu.py` took 34 minutes, and the cache reuse and corruption check
+`python/tests/test_fp16_gpu.py` took 34 minutes, and the cache reuse and corruption check
 alone took 38 minutes.
 
 Outside pytest, the numerical comparison entries store encoder and decoder engines
@@ -281,13 +301,13 @@ short-form clipping in fp32, including for fp16 recognition. Short-form features
 pass directly to the encoder on the device. Long-form transforms use overlapping
 blocks and return their log features to the existing host window selector; clipping
 uses one threshold for the entire recording. All three engines follow the same
-explicit rebuild policy. The builder uses optimization level 5 with TF32 disabled.
+automatic recovery policy. The builder uses optimization level 5 with TF32 disabled.
 
 The cache identity includes the checkpoint configuration, weight files, precision,
 GPU, TensorRT version, input shapes, and a graph version for each of the mel, encoder,
 and decoder. The mel identity also includes its filter asset and recognition precision;
 its arithmetic remains fp32. The versions live in `_GRAPH_VERSION` in
-`src/listenflow/fastest_whisper/_engines.py`. When a change to `_network.py` or `_mel.py`
+`python/src/listenflow/fastest_whisper/_engines.py`. When a change to `_network.py` or `_mel.py`
 alters a graph in a way that makes its serialized engine incompatible, raise that
 graph's version. Raise all affected versions when build settings change.
 Review the graph version in the same change as the graph,
@@ -301,7 +321,7 @@ segments. It computes the mel features for the whole recording, then advances
 30-second windows using decoded timestamp tokens and passes confirmed text and
 timestamps to the next window. The existing `transcribe_fp32` and
 `transcribe_fp16` entry points keep their single-window decode path. The
-[long-form fp32 evaluation script](https://github.com/sync-dev-org/listenflow-fastest-whisper/blob/main/scripts/evaluate_longform.py)
+[long-form fp32 evaluation script](https://github.com/sync-dev-org/listenflow-fastest-whisper/blob/main/python/scripts/evaluate_longform.py)
 compares complete transcripts, timed segments, and decoded token sequences.
 
 ## Fixed fp32 reference
@@ -334,7 +354,7 @@ reference recording. The three spoken sentences about a fishing boat were
 written for the related repository. This repository distributes the generated
 speech under MIT, as does its source repository; the external synthesis model
 and weights retain Apache-2.0. The runtime, weights, settings, text, conversion,
-and source hashes are recorded in `tests/fixtures/small_boat_speech_record.txt`.
+and source hashes are recorded in `python/tests/fixtures/small_boat_speech_record.txt`.
 
 The WAV contains 186,880 samples (11.68 seconds) of mono 16 kHz signed 16-bit
 PCM. Its SHA-256 is
@@ -351,7 +371,7 @@ external input; regenerating the recognition references uses the checked-in
 16 kHz fixture directly. The second WAV contains one second of zero samples,
 generated for this repository; its SHA-256 is
 `643f8a8dc8bd9c19225afffad2becfec5426180b3749cb208abdf1a6c8354efc`.
-Both fixtures are in `tests/fixtures/`, so reference regeneration needs no
+Both fixtures are in `python/tests/fixtures/`, so reference regeneration needs no
 sibling repository.
 The Japanese language detection fixture is a 25.5-second excerpt of
 [Marsian's Japanese pronunciation recording](https://commons.wikimedia.org/wiki/File:Ja-pronunciation-practice5.ogg).
@@ -367,11 +387,11 @@ ffmpeg -nostdin -hide_banner -loglevel error \
   -c:a pcm_s16le ja_pronunciation_practice5_25s_16khz_mono_s16le.wav
 ```
 
-The WAV in `tests/fixtures/` has SHA-256
+The WAV in `python/tests/fixtures/` has SHA-256
 `8fc6dc380db5d2b7197c53926657441b7906eefd3217cfa909d0f640ddb8829a`.
 With this exact WAV, openai-whisper 20250625 large-v3 on CPU detects token 50266,
 `<|ja|>`, from the first 30-second padded mel window. No audio was played or recorded.
-The mel filter coefficients in `src/listenflow/fastest_whisper/assets/mel_filters.npz`
+The mel filter coefficients in `python/src/listenflow/fastest_whisper/assets/mel_filters.npz`
 come from [openai-whisper](https://github.com/openai/whisper), which is MIT licensed.
 
 For each WAV, the generator divides PCM16 samples by 32768, right-pads or trims to
@@ -400,7 +420,7 @@ repeat the synthetic waveform three times (35.04 seconds) to cross a
 30-second window, and record segment boundaries and each window's tokens
 and previous-text prompt. All outputs come from the official CPU fp32
 implementation. The generated arrays and their hashes are in
-`tests/fixtures/oracle/`.
+`python/tests/fixtures/oracle/`.
 The numerical tests allow absolute and relative errors of `3e-5` for log-mel,
 an absolute error of `2e-2` and relative error of `5e-3` for encoder output,
 and absolute and relative errors of `2e-2` for raw logits. CPU FFT rounding and

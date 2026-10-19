@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.20)
+# SP-LFFASTESTWHISPER-007, SP-LFFASTESTWHISPER-011: inspect the Linux registration ABI without Python or GPU use.
+execute_process(COMMAND "${NM}" -D --defined-only "${PLUGIN_LIBRARY}"
+    RESULT_VARIABLE status OUTPUT_VARIABLE symbols ERROR_VARIABLE error)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "Cannot read plugin symbols: ${error}")
+endif()
+foreach(symbol IN ITEMS getCreators setLoggerFinder tensoracle_bundle_sha256)
+    if(NOT symbols MATCHES "[ \t]${symbol}(\n|$)")
+        message(FATAL_ERROR "Plugin lacks required export: ${symbol}")
+    endif()
+endforeach()
+
+execute_process(COMMAND "${READELF}" -d "${PLUGIN_LIBRARY}"
+    RESULT_VARIABLE status OUTPUT_VARIABLE dynamic ERROR_VARIABLE error)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "Cannot read plugin dependencies: ${error}")
+endif()
+set(allowed libcuda.so.1 libnvinfer.so.11 libstdc++.so.6 libgcc_s.so.1
+    libm.so.6 libc.so.6 libpthread.so.0 libdl.so.2 librt.so.1 ld-linux-x86-64.so.2)
+string(REGEX MATCHALL "\\(NEEDED\\)[^\n]*\\[[^]]+\\]" needed "${dynamic}")
+if(NOT needed)
+    message(FATAL_ERROR "Plugin has no ELF dependency entries")
+endif()
+foreach(entry IN LISTS needed)
+    string(REGEX REPLACE ".*\\[([^]]+)\\]" "\\1" name "${entry}")
+    if(NOT name IN_LIST allowed)
+        message(FATAL_ERROR "Plugin has an unexpected ELF dependency: ${name}")
+    endif()
+endforeach()
+if(dynamic MATCHES "\\((RPATH|RUNPATH)\\)")
+    message(FATAL_ERROR "Plugin contains a build-host library search path")
+endif()

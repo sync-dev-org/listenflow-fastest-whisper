@@ -1,0 +1,117 @@
+[project]
+name = "listenflow-fastest-whisper"
+dynamic = ["version"]
+description = "Whisper-family TensorRT inference for listenflow"
+readme = "README.md"
+authors = [{ name = "minamik", email = "mia@sync.dev" }]
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.14"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "cuda-python>=13.0",
+    "listenflow>=0.17.6",
+    "numpy>=2.0",
+    "safetensors>=0.4",
+    "tensoracle==1.1.0",
+    "tensorrt-cu13>=11.0",
+    "tokenizers>=0.22",
+]
+
+[project.urls]
+Repository = "https://github.com/sync-dev-org/listenflow-fastest-whisper"
+
+[build-system]
+requires = ["scikit-build-core>=1.0,<2", "setuptools-scm>=9,<11"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+minimum-version = "1.0"
+wheel.packages = ["src/listenflow"]
+wheel.py-api = "py3"
+sdist.include = ["src/listenflow/fastest_whisper/_version.py"]
+sdist.exclude = ["tests/**", "scripts/**", "uv.lock", "/README.md", "/LICENSE"]
+
+[tool.scikit-build.sdist.force-include]
+"../cpp" = "cpp"
+"../README.md" = "README.md"
+"../LICENSE" = "LICENSE"
+
+[tool.scikit-build.cmake.define]
+BUILD_TESTING = false
+TENSORACLE_CPP_ROOT = { env = "TENSORACLE_CPP_ROOT", default = "" }
+TENSORRT_ROOT = { env = "TENSORRT_ROOT", default = "" }
+LFFW_BUNDLE_ROOT = { env = "LFFW_BUNDLE_ROOT", default = "" }
+CUDAToolkit_ROOT = { env = "CUDAToolkit_ROOT", default = "/usr/local/cuda" }
+
+[[tool.scikit-build.overrides]]
+if.state = "editable"
+editable.mode = "inplace"
+wheel.cmake = false
+
+[[tool.dynamic-metadata]]
+provider = "scikit_build_core.metadata.setuptools_scm"
+
+[tool.setuptools_scm]
+root = ".."
+fallback_version = "0.0.0.dev0"
+version_scheme = "only-version"
+local_scheme = "no-local-version"
+tag_regex = "^v(?P<version>[^/]+)$"
+version_file = "src/listenflow/fastest_whisper/_version.py"
+
+[tool.setuptools_scm.scm.git]
+describe_command = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--exact-match",
+    "--match",
+    "v*",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.8"]
+oracle = ["openai-whisper==20250625", "torch>=2.0"]
+cubin = ["tensoracle[producer]==1.1.0"]
+evaluation = [
+    "ctranslate2",
+    "faster-whisper==1.2.1",
+    "jiwer",
+    "openai-whisper==20250625",
+    "soundfile",
+    "torch>=2.0",
+    "transformers",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+markers = [
+    "gpu: opt-in tests requiring a CUDA GPU and local checkpoint",
+    "req(id): ID of the adopted spec item the test verifies",
+]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests", "scripts"]
+extend-exclude = ["src/listenflow/fastest_whisper/_version.py"]
