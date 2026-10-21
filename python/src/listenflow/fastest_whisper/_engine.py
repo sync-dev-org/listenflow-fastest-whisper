@@ -9,7 +9,6 @@ import weakref
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 from listenflow.engine import validate_input_format
@@ -37,6 +36,7 @@ from listenflow import (
 )
 
 from ._decoding import DecodingSettings, decoding_settings
+from ._precision import PRECISIONS, Precision
 
 _DEFAULT_BOUNDARY_SETTINGS = UtteranceBoundarySettings()
 
@@ -105,7 +105,7 @@ class FastestWhisperEngine(STTEngineBase):
         self,
         *,
         model_source: OfflineModelDirectorySource,
-        precision: Literal["fp16", "fp32"],
+        precision: Precision,
         device: int,
         language: str | None,
         initial_prompt: str | None = None,
@@ -120,10 +120,8 @@ class FastestWhisperEngine(STTEngineBase):
     ) -> None:
         if not isinstance(model_source, OfflineModelDirectorySource):
             raise ConfigurationError("model_source must be OfflineModelDirectorySource")
-        if not isinstance(precision, str):
-            raise ConfigurationError("precision must be 'fp16' or 'fp32'")
-        if precision not in ("fp16", "fp32"):
-            raise ConfigurationError("precision must be 'fp16' or 'fp32'")
+        if not isinstance(precision, str) or precision not in PRECISIONS:
+            raise ConfigurationError(f"precision must be one of {', '.join(PRECISIONS)}")
         if type(device) is bool:
             raise ConfigurationError("device must be a non-negative integer")
         if not isinstance(device, int):
@@ -232,9 +230,17 @@ class FastestWhisperEngine(STTEngineBase):
             raise RuntimeError(
                 f"CUDA device {self.device} is unavailable; {count} visible device(s)"
             )
-        if capability not in ((8, 6), (8, 9), (12, 0)):
+        if not any(capability in policy.capabilities for policy in PRECISIONS.values()):
             raise RuntimeError(
                 f"CUDA device {self.device} compute capability {capability} is unsupported"
+            )
+        if capability not in PRECISIONS[self.precision].capabilities:
+            available = ", ".join(
+                name for name, policy in PRECISIONS.items() if capability in policy.capabilities
+            )
+            raise RuntimeError(
+                f"{self.precision} is unsupported on sm{capability[0]}{capability[1]}; "
+                f"select {available}"
             )
         importlib.import_module("tensorrt")
         _check_cancelled(cancelled)

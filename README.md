@@ -76,13 +76,20 @@ errors, and TensorRT engine reuse.
 ## Engine contract
 
 `FastestWhisperEngine` is the listenflow-facing entry point. Construct it with an
-`OfflineModelDirectorySource`, a required precision (`fp32` or `fp16`), a required
+`OfflineModelDirectorySource`, a required precision (`fp32`, `fp16`, or `fp8`), a required
 CUDA device number, and a required language (`en` or `None`). An optional
 `initial_prompt` supplies text hints for recognition. It accepts 16 kHz mono
 PCM in s16le by default or little-endian f32 when `input_format=EngineInputFormat.PCM_F32`.
 `boundary_settings` defaults to `UtteranceBoundarySettings()`. The async
 `prepare()` checks CUDA, TensorRT, the device number, and GPU generation, loads or
 builds the mel, encoder, and decoder TensorRT engines, and runs a trial inference.
+FP8 requires sm89 or sm120; selecting it on sm86 raises an environment error
+that offers fp32 and fp16. Its linear inputs and weights use E4M3 Q/DQ, while
+KV cache, logits and surrounding operations retain fp16 types. The package
+includes activation scales calibrated on the official large-v3 weights with
+LibriSpeech dev audio; preparation does not run calibration. Weight variants
+are accepted, but their accuracy with these scales has not been established.
+Changes to these scales or the FP8 graph invalidate saved FP8 engines automatically.
 Call it before reading
 `stream()`, or use `async with engine` to prepare and release the model automatically.
 `stream()` yields listenflow transcript events. `health()` reports `state`, `busy`,

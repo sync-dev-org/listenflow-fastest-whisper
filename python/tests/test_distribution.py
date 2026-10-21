@@ -96,6 +96,10 @@ def test_sdist_contains_only_package_sources_and_build_inputs(distributions):
     assert allowed_files <= paths.keys()
     assert package / "__init__.py" in paths
     assert package / "assets/mel_filters.npz" in paths
+    assert (
+        paths[package / "assets/fp8-scales.json"]
+        == (PROJECT / "src/listenflow/fastest_whisper/assets/fp8-scales.json").read_bytes()
+    )
     assert PurePosixPath("cpp/CMakeLists.txt") in paths
     assert PurePosixPath("cpp/README.md") in paths
     assert PurePosixPath("cpp/fc1_plugin.cpp") in paths
@@ -112,6 +116,10 @@ def test_wheel_contains_only_the_package_and_distribution_metadata(distributions
     assert all(name == "listenflow" or name.endswith(".dist-info") for name in top_levels)
     assert PurePosixPath("listenflow/fastest_whisper/__init__.py") in paths
     assert PurePosixPath("listenflow/fastest_whisper/assets/mel_filters.npz") in paths
+    assert (
+        paths[PurePosixPath("listenflow/fastest_whisper/assets/fp8-scales.json")]
+        == (PROJECT / "src/listenflow/fastest_whisper/assets/fp8-scales.json").read_bytes()
+    )
     library = PurePosixPath("listenflow/fastest_whisper/liblffw_fc1_plugin.so")
     assert paths[library].startswith(b"\x7fELF")
     assert [path for path in paths if path.suffix == ".so"] == [library]
@@ -163,7 +171,7 @@ def test_source_archive_rebuilds_the_native_wheel(distributions, tmp_path):
     with zipfile.ZipFile(distributions["wheel"]) as archive:
         assert set(rebuilt) == set(archive.namelist())
         for name, data in rebuilt.items():
-            if name.endswith(("/METADATA", "/WHEEL", "/LICENSE")):
+            if name.endswith(("/METADATA", "/WHEEL", "/LICENSE", "/fp8-scales.json")):
                 assert data == archive.read(name)
 
 

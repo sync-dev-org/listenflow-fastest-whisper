@@ -48,13 +48,13 @@ def pcm(path):
         return source.readframes(source.getnframes())
 
 
-async def stream(checkpoint, audio):
+async def stream(checkpoint, audio, precision):
     async def chunks():
         yield pcm(audio)
 
     async with FastestWhisperEngine(
         model_source=OfflineModelDirectorySource(str(checkpoint)),
-        precision="fp16",
+        precision=precision,
         device=0,
         language="en",
         temperature=0.0,
@@ -64,16 +64,17 @@ async def stream(checkpoint, audio):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--precision", choices=("fp16", "fp32", "fp8"), default="fp16")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--audio", type=Path, action="append", required=True)
     parser.add_argument("--expect", type=Path)
     parser.add_argument("--reuse", action="store_true")
     args = parser.parse_args()
     before = saved_engines()
-    transcripts = asyncio.run(stream(args.checkpoint, args.audio[0]))
+    transcripts = asyncio.run(stream(args.checkpoint, args.audio[0], args.precision))
     assert transcripts and all(transcripts)
     tokens = []
-    with CachedWhisper(args.checkpoint, precision="fp16") as model:
+    with CachedWhisper(args.checkpoint, precision=args.precision) as model:
         for audio in args.audio:
             samples = np.frombuffer(pcm(audio), dtype="<i2").astype(np.float32) / 32768
             encoded = model.encode(model._mel_spectrogram(samples))
@@ -91,6 +92,7 @@ def main():
         json.dumps(
             {
                 "python": platform.python_version(),
+                "precision": args.precision,
                 "versions": {
                     dist.metadata["Name"]: dist.version
                     for dist in importlib.metadata.distributions()

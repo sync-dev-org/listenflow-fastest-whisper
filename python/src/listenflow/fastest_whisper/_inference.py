@@ -37,6 +37,7 @@ from ._longform import (
     decoder_prefix,
     transcribe_mel,
 )
+from ._precision import PRECISIONS
 
 _DEFAULT_DECODING_SETTINGS = DecodingSettings()
 
@@ -550,7 +551,7 @@ class TensorRTWhisper:
     """Own the two TensorRT engines during one comparison or transcription."""
 
     def __init__(self, checkpoint_dir: Path, *, precision: str = "fp32", device: int = 0):
-        if precision not in ("fp32", "fp16"):
+        if precision not in PRECISIONS:
             raise ValueError(f"unsupported precision: {precision}")
         self.checkpoint_dir = Path(checkpoint_dir)
         self.precision = precision
@@ -774,7 +775,7 @@ class TensorRTWhisper:
         offset = 0 if parent is None else len(parent.logits)
         rows = [] if parent is None else list(parent.logits)
         c = self.config
-        dtype = np.float16 if self.precision == "fp16" else np.float32
+        dtype = np.dtype(PRECISIONS[self.precision].dtype)
         empty_shape = (c.text_layers, 1, c.text_heads, 1, c.audio_state // c.text_heads)
         cache = (
             {
@@ -847,7 +848,7 @@ class TensorRTWhisper:
         no_speech_prob = float("nan")
         for position in range(self._greedy_length, len(prefix)):
             self._check_cancelled()
-            dtype = np.float16 if self.precision == "fp16" else np.float32
+            dtype = np.dtype(PRECISIONS[self.precision].dtype)
             empty_shape = (c.text_layers, 1, c.text_heads, 1, c.audio_state // c.text_heads)
             cache = self._greedy_cache or {
                 name: np.zeros(empty_shape, dtype=dtype) for name in ("self_keys", "self_values")

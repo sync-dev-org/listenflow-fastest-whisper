@@ -1,5 +1,7 @@
 """Declare the shared encoder and decoder builds for cached and comparison runs."""
 
+import json
+
 import tensorrt as trt
 from tensoracle import (
     BuilderSettings,
@@ -17,6 +19,7 @@ from ._checkpoint import Checkpoint
 from ._mel import _MelGraph
 from ._network import _Graph
 from ._plugins import _fc1_library
+from ._precision import PRECISIONS
 
 # Increase the relevant value when a graph change makes an older serialized engine incompatible.
 _GRAPH_VERSION = {"mel": "2", "encoder": "3", "decoder": "5"}
@@ -91,7 +94,7 @@ def open_whisper_engine(
     """Open one graph with the same identity and build settings on both inference paths."""
     c = checkpoint.config
     name = "decoder" if decoder else "encoder"
-    output_dtype = trt.float16 if precision == "fp16" else trt.float32
+    output_dtype = getattr(trt, PRECISIONS[precision].dtype)
     head_dim = c.audio_state // c.text_heads
     cross_shape = (c.text_layers, 1, c.text_heads, c.audio_positions, head_dim)
     if decoder:
@@ -155,10 +158,25 @@ def open_whisper_engine(
     if decoder:
         weight_files.append(checkpoint.directory / "tokenizer.json")
     graph_owners: list[_Graph] = []
+    scales = None
+    graph_version = f"{_GRAPH_VERSION[name]}-{precision}"
+    if precision == "fp8":
+        from . import _fp8
+
+        scales = json.loads(_fp8._SCALES.read_text())
+        if not isinstance(scales, dict):
+            raise ValueError("FP8 scales must map linear input names to scalar values")
+        weight_files.append(_fp8._SCALES)
+        graph_version = f"{_GRAPH_VERSION[name]}-{_fp8._GRAPH_VERSION}"
     plugins = (_fc1_library(),) if decoder and precision == "fp16" else ()
 
     def define_graph(network: trt.INetworkDefinition) -> None:
-        graph = _Graph(network, checkpoint, precision)
+        if scales is None:
+            graph = _Graph(network, checkpoint, precision)
+        else:
+            from ._fp8 import _Fp8Graph
+
+            graph = _Fp8Graph(network, checkpoint, scales)
         graph_owners.append(graph)
         if decoder:
             graph.decoder()
@@ -170,7 +188,7 @@ def open_whisper_engine(
         define_graph,
         EngineBuild(inputs=inputs, settings=_SETTINGS),
         name=f"listenflow-fastest-whisper-{name}",
-        graph_version=f"{_GRAPH_VERSION[name]}-{precision}",
+        graph_version=graph_version,
         weights=weight_files,
         plugins=plugins,
         io=io,
