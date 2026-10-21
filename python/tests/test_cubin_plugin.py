@@ -48,7 +48,9 @@ def test_fp16_bundle_contains_reproducible_cubins_for_each_supported_gpu(bundle,
 
     manifest = json.loads((outputs[0] / "bundle.json").read_text())
     assert {entry["id"] for entry in manifest["entries"]} == {
-        f"sm{sm}.{kernel}" for sm in (86, 89, 120) for kernel in ("bias_fp16", "qkv_fp16", "fc1_fp16")
+        f"sm{sm}.{kernel}"
+        for sm in (86, 89, 120)
+        for kernel in ("bias_fp16", "qkv_fp16", "fc1_fp16")
     }
     assert all(
         entry["signature"]

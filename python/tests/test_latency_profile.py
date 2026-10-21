@@ -142,6 +142,7 @@ def cpu_native(monkeypatch):
 
     clock = SimpleNamespace(seconds=0.0)
     allocations, events, trace = {}, {}, []
+    host_allocations = {}
     transfers = []
     graph_state = SimpleNamespace(capture=None, executables={}, captures=0, next_id=1)
     success = cudart.cudaError_t.cudaSuccess
@@ -156,6 +157,16 @@ def cpu_native(monkeypatch):
     def free(pointer):
         del allocations[pointer]
         clock.seconds += 0.0005
+        return (success,)
+
+    def allocate_host(size):
+        block = ctypes.create_string_buffer(size)
+        pointer = ctypes.addressof(block)
+        host_allocations[pointer] = block
+        return success, pointer
+
+    def free_host(pointer):
+        del host_allocations[pointer]
         return (success,)
 
     def copy(destination, source, size, kind, stream):
@@ -205,6 +216,8 @@ def cpu_native(monkeypatch):
     for name, callback in (
         ("cudaMalloc", allocate),
         ("cudaFree", free),
+        ("cudaMallocHost", allocate_host),
+        ("cudaFreeHost", free_host),
         ("cudaMemcpyAsync", copy),
         ("cudaEventCreate", create_event),
         ("cudaEventRecord", record),
@@ -410,6 +423,7 @@ def cpu_native(monkeypatch):
     yield model, cudart, lambda: clock.seconds, events, trace
     model.close()
     assert not allocations
+    assert not host_allocations
     assert not graph_state.executables
 
 

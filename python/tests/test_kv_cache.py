@@ -177,6 +177,8 @@ def native_io(monkeypatch):
 
     allocations, copies = {}, []
     fail = SimpleNamespace(enqueue=False, malloc_calls=0, free_calls=0, sync_calls=0)
+    fail.host_allocations = {}
+    fail.host_malloc_calls = fail.host_free_calls = 0
     success = cudart.cudaError_t.cudaSuccess
 
     def allocate(size):
@@ -190,6 +192,18 @@ def native_io(monkeypatch):
         fail.free_calls += 1
         assert pointer in allocations, "an allocation was returned twice"
         del allocations[pointer]
+        return (success,)
+
+    def allocate_host(size):
+        fail.host_malloc_calls += 1
+        block = ctypes.create_string_buffer(size)
+        pointer = ctypes.addressof(block)
+        fail.host_allocations[pointer] = block
+        return success, pointer
+
+    def free_host(pointer):
+        fail.host_free_calls += 1
+        del fail.host_allocations[pointer]
         return (success,)
 
     def copy(destination, source, size, kind, *stream):
@@ -261,11 +275,14 @@ def native_io(monkeypatch):
     monkeypatch.setattr(cudart, "cudaStreamDestroy", lambda stream: (success,))
     monkeypatch.setattr(cudart, "cudaMalloc", allocate)
     monkeypatch.setattr(cudart, "cudaFree", free)
+    monkeypatch.setattr(cudart, "cudaMallocHost", allocate_host)
+    monkeypatch.setattr(cudart, "cudaFreeHost", free_host)
     monkeypatch.setattr(cudart, "cudaMemcpyAsync", copy)
     monkeypatch.setattr(cudart, "cudaMemcpy", copy)
     io = _HostIO(EngineHandle(Engine(), object(), Path("kv-test.engine")))
     yield io, allocations, copies, fail, cudart.cudaMemcpyKind
     io.close()
+    assert not fail.host_allocations
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")

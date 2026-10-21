@@ -118,7 +118,9 @@ def test_public_long_entry_with_hint_matches_official_segments(model, monkeypatc
     """The public long-form entry passes the hint across windows and excludes it from text."""
     from contextlib import nullcontext
 
-    oracle = json.loads((FIXTURES / "oracle" / "initial_prompt_long_small_boat_repeat.json").read_text())
+    oracle = json.loads(
+        (FIXTURES / "oracle" / "initial_prompt_long_small_boat_repeat.json").read_text()
+    )
     samples = np.tile(read_pcm16_mono(FIXTURES / "small_boat_16khz_mono_s16le.wav"), 3)
     monkeypatch.setattr(_inference, "TensorRTWhisper", lambda *_args, **_kwargs: nullcontext(model))
 

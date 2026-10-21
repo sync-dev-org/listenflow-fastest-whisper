@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import threading
 import zlib
 from collections.abc import Callable, Sequence
@@ -40,6 +41,7 @@ from ._longform import (
 from ._precision import PRECISIONS
 
 _DEFAULT_DECODING_SETTINGS = DecodingSettings()
+_CACHE_BOUNDARIES = (1, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448)
 
 
 def _cuda(result: tuple, operation: str):
@@ -120,6 +122,21 @@ class _EncodedAudio:
         _release_tensors(self.tensors)
 
 
+class _GreedyCache(_DeviceTensor):
+    """Borrow padded input storage for the next step of one mutable greedy chain."""
+
+    def __init__(self, tensor, owner, length, bucket):
+        super().__init__(
+            tensor.pointer,
+            (*tensor.shape[:-2], bucket, tensor.shape[-1]),
+            tensor.dtype,
+            tensor.device,
+            release=lambda: None,
+        )
+        self.owner = owner
+        self.length = length
+
+
 @dataclass
 class _PrefixState:
     tensors: dict[str, np.ndarray | _DeviceTensor]
@@ -134,6 +151,16 @@ class _Buffer:
     pointer: int
     nbytes: int
     lease: _DeviceTensor | None = None
+
+
+@dataclass
+class _TensorIO:
+    name: str
+    dtype: type
+    shape: tuple[int, ...]
+    nbytes: int
+    buffer: _Buffer | None = None
+    host: np.ndarray | None = None
 
 
 class _CudaGraphs:
@@ -206,8 +233,11 @@ class _HostIO:
         self.execution = None
         self.stream = None
         self._buffers: dict[str, list[_Buffer]] = {}
+        self._host_buffers: dict[str, tuple[int, np.ndarray]] = {}
         self._capacities: dict[str, int] = {}
         self._graphs = None
+        self._layouts = {}
+        self._input_shapes = None
         try:
             _cuda(cudart.cudaSetDevice(device), "cudaSetDevice")
             self.execution = handle.create_execution()
@@ -249,6 +279,8 @@ class _HostIO:
         self.stream = None
         execution, self.execution = getattr(self, "execution", None), None
         graphs, self._graphs = getattr(self, "_graphs", None), None
+        self._layouts = {}
+        self._input_shapes = None
         try:
             if stream is not None:
                 _cuda(cudart.cudaSetDevice(self.device), "cudaSetDevice")
@@ -269,14 +301,40 @@ class _HostIO:
                             buffer.lease.close()
                         _cuda(cudart.cudaFree(buffer.pointer), "cudaFree")
             finally:
-                if execution is not None:
-                    execution.close()
+                try:
+                    host_buffers, self._host_buffers = self._host_buffers, {}
+                    for pointer, _ in host_buffers.values():
+                        _cuda(cudart.cudaFreeHost(pointer), "cudaFreeHost")
+                finally:
+                    if execution is not None:
+                        execution.close()
 
     def _enqueue(self, addresses, *, stream):
         if self._graphs is None:
             self.execution.enqueue(addresses, stream=stream)
         else:
             self._graphs.enqueue(self.execution, addresses, stream=stream)
+
+    def _layout(self, prepared):
+        key = tuple(prepared[name].shape for name in self.ranged_inputs)
+        layout = self._layouts.get(key)
+        if layout is None:
+            shapes = dict(zip(self.ranged_inputs, key, strict=True))
+            self._input_shapes = None
+            self.execution.set_input_shapes(shapes)
+            tensors = []
+            for name in (*self.inputs, *self.outputs):
+                dtype = trt.nptype(self.execution.get_tensor_dtype(name))
+                shape = self.execution.get_tensor_shape(name)
+                nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+                tensors.append(_TensorIO(name, dtype, shape, nbytes))
+            layout = shapes, tuple(tensors)
+            self._layouts[key] = layout
+        elif self._input_shapes is not layout[0]:
+            self._input_shapes = None
+            self.execution.set_input_shapes(layout[0])
+        self._input_shapes = layout[0]
+        return layout[1]
 
     def _buffer(self, name: str, nbytes: int) -> _Buffer:
         entries = self._buffers.setdefault(name, [])
@@ -289,6 +347,17 @@ class _HostIO:
         entries.append(buffer)
         return buffer
 
+    def _host_array(self, tensor: _TensorIO) -> np.ndarray:
+        if tensor.host is None:
+            allocation = self._host_buffers.get(tensor.name)
+            if allocation is None:
+                capacity = max(1, tensor.nbytes, self._capacities[tensor.name])
+                pointer = int(_cuda(cudart.cudaMallocHost(capacity), "cudaMallocHost"))
+                raw = np.ctypeslib.as_array((ctypes.c_ubyte * capacity).from_address(pointer))
+                allocation = self._host_buffers[tensor.name] = pointer, raw
+            tensor.host = allocation[1][: tensor.nbytes].view(tensor.dtype).reshape(tensor.shape)
+        return tensor.host
+
     def _lease(self, buffer: _Buffer, shape: tuple[int, ...], dtype) -> _DeviceTensor:
         def release():
             buffer.lease = None
@@ -296,11 +365,12 @@ class _HostIO:
         buffer.lease = _DeviceTensor(buffer.pointer, shape, dtype, self.device, release=release)
         return buffer.lease
 
-    def _pad_cache(self, inputs):
-        """Use stable input addresses and mask padding without changing the compact cache."""
-        boundaries = (1, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448)
+    def _pad_cache(self, inputs, *, reuse=False):
+        """Pad immutable histories or reuse one greedy chain at stable input addresses."""
         shape = inputs["self_keys"].shape
         length, width = shape[-2:]
+        if reuse and isinstance(inputs["self_keys"], _GreedyCache):
+            length = inputs["self_keys"].length
         for name in ("self_keys", "self_values", "mask"):
             array = inputs[name]
             low, high = self.execution._ranges[name]
@@ -313,7 +383,7 @@ class _HostIO:
                 raise ValueError(f"{name} has an incompatible dtype")
         if inputs["self_values"].shape != shape or inputs["mask"].shape[-1] != length + 1:
             raise ValueError("decoder keys, values and mask must share one cache length")
-        bucket = next(value for value in boundaries if value >= length)
+        bucket = next(value for value in _CACHE_BOUNDARIES if value >= length)
         rows = int(np.prod(shape[:-2]))
         rowbytes = width * inputs["self_keys"].dtype.itemsize
         padded, borrowed = dict(inputs), []
@@ -325,26 +395,34 @@ class _HostIO:
                 if source.device != self.device:
                     raise ValueError(f"{name} must be on CUDA device {self.device}")
             buffer = self._buffer(name, rows * bucket * rowbytes)
-            _cuda(
-                cudart.cudaMemsetAsync(buffer.pointer, 0, rows * bucket * rowbytes, self.stream),
-                "cudaMemsetAsync padded cache",
-            )
-            resident = isinstance(source, _DeviceTensor)
-            _cuda(
-                cudart.cudaMemcpy2DAsync(
-                    buffer.pointer,
-                    bucket * rowbytes,
-                    source.pointer if resident else source.ctypes.data,
-                    length * rowbytes,
-                    length * rowbytes,
-                    rows,
-                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
-                    if resident
-                    else cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
-                    self.stream,
-                ),
-                "cudaMemcpy2DAsync padded cache",
-            )
+            if reuse and isinstance(source, _GreedyCache):
+                if source.owner is not self or source.pointer != buffer.pointer:
+                    raise ValueError(f"{name} belongs to another greedy cache")
+                if source.length != length or source.shape[-2] != bucket:
+                    raise ValueError("decoder keys and values must share one greedy cache length")
+            else:
+                _cuda(
+                    cudart.cudaMemsetAsync(
+                        buffer.pointer, 0, rows * bucket * rowbytes, self.stream
+                    ),
+                    "cudaMemsetAsync padded cache",
+                )
+                resident = isinstance(source, _DeviceTensor)
+                _cuda(
+                    cudart.cudaMemcpy2DAsync(
+                        buffer.pointer,
+                        bucket * rowbytes,
+                        source.pointer if resident else source.ctypes.data,
+                        length * rowbytes,
+                        length * rowbytes,
+                        rows,
+                        cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
+                        if resident
+                        else cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                        self.stream,
+                    ),
+                    "cudaMemcpy2DAsync padded cache",
+                )
             tensor = _DeviceTensor(
                 buffer.pointer,
                 (*shape[:-2], bucket, width),
@@ -359,6 +437,41 @@ class _HostIO:
         mask[..., -1] = inputs["mask"][..., -1]
         padded["mask"] = mask
         return padded, borrowed, length
+
+    def _advance_cache(self, source, target, length):
+        """Append one position, moving the full history only to enter a larger bucket."""
+        bucket, width = target.shape[-2:]
+        if length == _CACHE_BOUNDARIES[-1]:
+            return source  # The final context position is already contiguous.
+        rows = int(np.prod(target.shape[:-2]))
+        rowbytes = width * source.dtype.itemsize
+        next_bucket = next(value for value in _CACHE_BOUNDARIES if value >= length + 1)
+        if next_bucket != bucket:
+            _cuda(
+                cudart.cudaMemsetAsync(
+                    target.pointer, 0, rows * next_bucket * rowbytes, self.stream
+                ),
+                "cudaMemsetAsync greedy cache",
+            )
+            offset, source_offset, copied = 0, 0, (length + 1) * rowbytes
+        else:
+            offset, source_offset, copied = length * rowbytes, bucket * rowbytes, rowbytes
+        _cuda(
+            cudart.cudaMemcpy2DAsync(
+                target.pointer + offset,
+                next_bucket * rowbytes,
+                source.pointer + source_offset,
+                (bucket + 1) * rowbytes,
+                copied,
+                rows,
+                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+                self.stream,
+            ),
+            "cudaMemcpy2DAsync greedy cache",
+        )
+        result = _GreedyCache(target, self, length + 1, next_bucket)
+        source.close()
+        return result
 
     def _compact_cache(self, name, source, length):
         """Move the appended position past the real history, independently in each row."""
@@ -398,6 +511,7 @@ class _HostIO:
         inputs: dict[str, np.ndarray | _DeviceTensor],
         *,
         device_outputs: tuple[str, ...] = (),
+        reuse_cache: bool = False,
     ) -> dict[str, np.ndarray | _DeviceTensor]:
         if self.execution is None:
             raise RuntimeError("host inference is closed")
@@ -413,13 +527,9 @@ class _HostIO:
         succeeded = False
         try:
             if self._graphs is not None:
-                prepared, borrowed, cache_length = self._pad_cache(prepared)
-            self.execution.set_input_shapes(
-                {name: prepared[name].shape for name in self.ranged_inputs}
-            )
-            for name in (*self.inputs, *self.outputs):
-                expected_dtype = trt.nptype(self.execution.get_tensor_dtype(name))
-                shape = self.execution.get_tensor_shape(name)
+                prepared, borrowed, cache_length = self._pad_cache(prepared, reuse=reuse_cache)
+            for tensor in self._layout(prepared):
+                name, expected_dtype, shape = tensor.name, tensor.dtype, tensor.shape
                 if name in self.inputs:
                     array = prepared[name]
                     if array.dtype != expected_dtype:
@@ -434,10 +544,11 @@ class _HostIO:
                         buffers[name] = array.pointer
                         continue
                 elif name not in device_outputs:
-                    array = np.empty(shape, dtype=expected_dtype)
+                    array = self._host_array(tensor)
                     outputs[name] = array
-                nbytes = int(np.prod(shape)) * np.dtype(expected_dtype).itemsize
-                buffer = self._buffer(name, nbytes)
+                buffer = tensor.buffer
+                if buffer is None or buffer.lease is not None:
+                    buffer = tensor.buffer = self._buffer(name, tensor.nbytes)
                 pointer = buffer.pointer
                 buffers[name] = pointer
                 if name in device_outputs:
@@ -457,7 +568,15 @@ class _HostIO:
             if cache_length is not None:
                 for name in ("present_keys", "present_values"):
                     if isinstance(outputs.get(name), _DeviceTensor):
-                        outputs[name] = self._compact_cache(name, outputs[name], cache_length)
+                        outputs[name] = (
+                            self._advance_cache(
+                                outputs[name],
+                                prepared[name.replace("present", "self")],
+                                cache_length,
+                            )
+                            if reuse_cache
+                            else self._compact_cache(name, outputs[name], cache_length)
+                        )
             for name, array in outputs.items():
                 if isinstance(array, _DeviceTensor):
                     continue
@@ -472,6 +591,12 @@ class _HostIO:
                     "cudaMemcpyAsync device-to-host",
                 )
             _cuda(cudart.cudaStreamSynchronize(self.stream), "cudaStreamSynchronize")
+            # Staging storage belongs to this exchange; returned values belong
+            # to the caller and must survive the next exchange and close().
+            outputs = {
+                name: array.copy() if isinstance(array, np.ndarray) else array
+                for name, array in outputs.items()
+            }
             if cache_length is not None:
                 for name in ("present_keys", "present_values"):
                     if isinstance(outputs.get(name), np.ndarray):
@@ -871,6 +996,7 @@ class TensorRTWhisper:
                     "present_values",
                     "token" if score else "greedy",
                 ),
+                reuse_cache=True,
             )
             masks[first] = outputs.pop("suppression", masks[first])
             _release_tensors(cache)

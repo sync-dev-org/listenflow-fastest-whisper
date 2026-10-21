@@ -56,7 +56,9 @@ def test_default_first_attempt_matches_greedy_in_the_same_engine_and_scores_its_
     checkpoint = os.environ.get("LFFW_CHECKPOINT_DIR")
     if os.environ.get("LFFW_USE_GPU") != "1" or not checkpoint:
         pytest.skip("set LFFW_USE_GPU=1 and LFFW_CHECKPOINT_DIR to run GPU comparisons")
-    samples = read_pcm16_mono(Path(__file__).parent / "fixtures" / "small_boat_16khz_mono_s16le.wav")
+    samples = read_pcm16_mono(
+        Path(__file__).parent / "fixtures" / "small_boat_16khz_mono_s16le.wav"
+    )
     attempts = []
 
     def observe(frame, event, _argument):

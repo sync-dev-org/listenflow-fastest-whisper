@@ -71,7 +71,7 @@ def token_runtime(monkeypatch):
             self._decoder.outputs = ("token", "logits", "present_keys", "present_values")
             self._mel = _HostIO.__new__(_HostIO)
 
-    def execute(_self, inputs, *, device_outputs=()):
+    def execute(_self, inputs, *, device_outputs=(), reuse_cache=False):
         if "audio" in inputs:
             from listenflow.fastest_whisper._audio import log_mel_spectrogram
 

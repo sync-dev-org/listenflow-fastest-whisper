@@ -173,7 +173,7 @@ def cpu_tensor_rt(tmp_path, monkeypatch):
         def __init__(self, precision):
             self.precision = precision
 
-        def run(self, inputs, *, device_outputs):
+        def run(self, inputs, *, device_outputs, reuse_cache=False):
             prefix = inputs["self_keys"].flatten()[1:].astype(int).tolist()
             prefix += inputs["tokens"][0].tolist()
             window = int(inputs["cross_keys"].flat[0])

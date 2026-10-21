@@ -22,11 +22,9 @@ from pathlib import Path
 def decoder_buckets(*, source=None):
     """Read the product's single definition instead of duplicating the bucket list."""
     if source is None:
-        import inspect
+        from listenflow.fastest_whisper._inference import _CACHE_BOUNDARIES
 
-        from listenflow.fastest_whisper._inference import _HostIO
-
-        source = inspect.getsource(_HostIO._pad_cache)
+        return _CACHE_BOUNDARIES
     for node in ast.walk(ast.parse(textwrap.dedent(source))):
         if isinstance(node, ast.Assign) and any(
             isinstance(target, ast.Name) and target.id == "boundaries" for target in node.targets
