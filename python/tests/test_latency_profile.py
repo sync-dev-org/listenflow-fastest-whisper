@@ -142,6 +142,7 @@ def cpu_native(monkeypatch):
 
     clock = SimpleNamespace(seconds=0.0)
     allocations, events, trace = {}, {}, []
+    completion_events = {}
     host_allocations = {}
     transfers = []
     graph_state = SimpleNamespace(capture=None, executables={}, captures=0, next_id=1)
@@ -193,6 +194,9 @@ def cpu_native(monkeypatch):
         return success, event
 
     def record(event, stream):
+        if event in completion_events:
+            completion_events[event] = clock.seconds
+            return (success,)
         events[event] = clock.seconds
         trace.append(("event", stream))
         return (success,)
@@ -202,8 +206,16 @@ def cpu_native(monkeypatch):
         return success, (events[stop] - events[start]) * 1000
 
     def destroy(event):
-        del events[event]
+        if event in completion_events:
+            del completion_events[event]
+        else:
+            del events[event]
         return (success,)
+
+    def create_completion(flags):
+        event = -len(completion_events) - 1
+        completion_events[event] = None
+        return success, event
 
     for name in (
         "cudaSetDevice",
@@ -220,7 +232,9 @@ def cpu_native(monkeypatch):
         ("cudaFreeHost", free_host),
         ("cudaMemcpyAsync", copy),
         ("cudaEventCreate", create_event),
+        ("cudaEventCreateWithFlags", create_completion),
         ("cudaEventRecord", record),
+        ("cudaEventQuery", lambda event: (success,)),
         ("cudaEventElapsedTime", elapsed),
         ("cudaEventDestroy", destroy),
     ):

@@ -172,6 +172,18 @@ def _synchronize() -> None:
         raise RuntimeError(f"cudaDeviceSynchronize failed: {result[0]}")
 
 
+def _measure(transcribe) -> tuple[str, float, float]:
+    """Time transcription and its final GPU drain with wall and process CPU clocks."""
+    _synchronize()
+    started = time.perf_counter_ns()
+    cpu_started = time.process_time_ns()
+    text = transcribe()
+    _synchronize()
+    cpu_seconds = (time.process_time_ns() - cpu_started) / 1e9
+    seconds = (time.perf_counter_ns() - started) / 1e9
+    return text, seconds, cpu_seconds
+
+
 def convert(checkpoint_dir: Path, model_dir: Path) -> None:
     """Convert the exact local checkpoint to a float16 CTranslate2 model."""
     import ctranslate2
@@ -341,25 +353,29 @@ def run(
     warmup_seconds = time.monotonic() - warmup_started
     observations.append(_gpu_sample(0))
     with partial_csv.open("x", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=["subset", "id", "frames", "seconds", "output"])
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=["subset", "id", "frames", "seconds", "process_cpu_seconds", "output"],
+        )
         writer.writeheader()
         for index, row in enumerate(rows, 1):
             samples = first_waveform if index == 1 else _load_waveform(row)
-            _synchronize()
-            started = time.perf_counter_ns()
             if route == "fp16":
-                text = _transcribe_tensor_rt(model, samples, settings)
+                text, seconds, cpu_seconds = _measure(
+                    lambda samples=samples: _transcribe_tensor_rt(model, samples, settings)
+                )
             else:
                 assert options is not None
-                text = _transcribe_faster_whisper(model, samples, options)
-            _synchronize()
-            seconds = (time.perf_counter_ns() - started) / 1e9
+                text, seconds, cpu_seconds = _measure(
+                    lambda samples=samples: _transcribe_faster_whisper(model, samples, options)
+                )
             writer.writerow(
                 {
                     "subset": "test-clean",
                     "id": row["id"],
                     "frames": row["frames"],
                     "seconds": seconds,
+                    "process_cpu_seconds": cpu_seconds,
                     "output": text,
                 }
             )

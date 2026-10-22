@@ -23,6 +23,36 @@ from listenflow.fastest_whisper._inference import Transcription
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
+def test_transcription_cpu_and_wall_clocks_include_final_gpu_completion(tmp_path, monkeypatch):
+    """Both clocks cover transcription and its last GPU wait, excluding the initial drain."""
+    from cuda.bindings import runtime as cu
+
+    clocks = {"wall": 0, "cpu": 0}
+    waits = []
+
+    def synchronize():
+        waits.append(True)
+        clocks["wall"] += 2
+        clocks["cpu"] += 1
+        return (cu.cudaError_t.cudaSuccess,)
+
+    def transcribe():
+        (tmp_path / "text").write_text("recognized")
+        clocks["wall"] += 100
+        clocks["cpu"] += 30
+        return "recognized"
+
+    monkeypatch.setattr(cu, "cudaDeviceSynchronize", synchronize)
+    monkeypatch.setattr(benchmark_latency.time, "perf_counter_ns", lambda: clocks["wall"])
+    monkeypatch.setattr(benchmark_latency.time, "process_time_ns", lambda: clocks["cpu"])
+    text, wall, cpu = benchmark_latency._measure(transcribe)
+    assert text == (tmp_path / "text").read_text() == "recognized"
+    assert len(waits) == 2
+    assert wall == pytest.approx(102e-9)
+    assert cpu == pytest.approx(31e-9)
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-001")
 @pytest.mark.req("SP-LFFASTESTWHISPER-005")
 def test_latency_report_groups_every_utterance_by_duration_and_uses_median_and_p95():
     """Each duration band reports its count, median, and 95th percentile in seconds."""

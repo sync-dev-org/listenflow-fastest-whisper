@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import platform
 import threading
 import zlib
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 from typing import Self
 
 import numpy as np
@@ -42,6 +44,27 @@ from ._precision import PRECISIONS
 
 _DEFAULT_DECODING_SETTINGS = DecodingSettings()
 _CACHE_BOUNDARIES = (1, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448)
+_POLL_INTERVAL_S = 50e-6
+_POLL_TIMER_SLACK_NS = 1
+_syscall = ctypes.CDLL("libc.so.6", use_errno=True).syscall
+_syscall.argtypes = [ctypes.c_long, ctypes.c_int, *([ctypes.c_ulong] * 4)]
+_syscall.restype = ctypes.c_long
+# Linux x86_64 SYS_prctl; libc's int-returning prctl would truncate timer slack.
+_prctl = partial(_syscall, 157)
+
+
+def _timer_slack(value: int | None = None) -> int:
+    machine = platform.machine()
+    if machine != "x86_64":
+        raise RuntimeError(
+            f"timer slack is unsupported on architecture {machine!r}; requires x86_64"
+        )
+    option = 30 if value is None else 29  # PR_GET_TIMERSLACK / PR_SET_TIMERSLACK
+    result = _prctl(option, 0 if value is None else value, 0, 0, 0)
+    if result == -1:
+        operation = "PR_GET_TIMERSLACK" if value is None else "PR_SET_TIMERSLACK"
+        raise OSError(ctypes.get_errno(), f"prctl({operation}) failed")
+    return ctypes.c_ulong(result).value
 
 
 def _cuda(result: tuple, operation: str):
@@ -232,6 +255,7 @@ class _HostIO:
         self.device = device
         self.execution = None
         self.stream = None
+        self._completion = None
         self._buffers: dict[str, list[_Buffer]] = {}
         self._host_buffers: dict[str, tuple[int, np.ndarray]] = {}
         self._capacities: dict[str, int] = {}
@@ -268,6 +292,10 @@ class _HostIO:
                 for name in names
             }
             self.stream = _cuda(cudart.cudaStreamCreate(), "cudaStreamCreate")
+            self._completion = _cuda(
+                cudart.cudaEventCreateWithFlags(cudart.cudaEventDisableTiming),
+                "cudaEventCreateWithFlags",
+            )
         except BaseException:
             self.close()
             # Retained initialization errors must not keep native owners alive.
@@ -277,6 +305,7 @@ class _HostIO:
     def close(self) -> None:
         stream = getattr(self, "stream", None)
         self.stream = None
+        completion, self._completion = getattr(self, "_completion", None), None
         execution, self.execution = getattr(self, "execution", None), None
         graphs, self._graphs = getattr(self, "_graphs", None), None
         self._layouts = {}
@@ -291,7 +320,11 @@ class _HostIO:
                         if graphs is not None:
                             graphs.close()
                     finally:
-                        _cuda(cudart.cudaStreamDestroy(stream), "cudaStreamDestroy")
+                        try:
+                            if completion is not None:
+                                _cuda(cudart.cudaEventDestroy(completion), "cudaEventDestroy")
+                        finally:
+                            _cuda(cudart.cudaStreamDestroy(stream), "cudaStreamDestroy")
         finally:
             try:
                 buffers, self._buffers = self._buffers, {}
@@ -308,6 +341,25 @@ class _HostIO:
                 finally:
                     if execution is not None:
                         execution.close()
+
+    def _wait(self) -> None:
+        _cuda(cudart.cudaEventRecord(self._completion, self.stream), "cudaEventRecord")
+        previous_slack = _timer_slack()
+        try:
+            _timer_slack(_POLL_TIMER_SLACK_NS)
+            while True:
+                result = cudart.cudaEventQuery(self._completion)
+                if result[0] != cudart.cudaError_t.cudaErrorNotReady:
+                    _cuda(result, "cudaEventQuery")
+                    break
+                sleep(_POLL_INTERVAL_S)
+        except BaseException as error:
+            try:
+                _timer_slack(previous_slack)
+            except OSError as restore_error:
+                error.add_note(f"Timer slack restoration also failed: {restore_error}")
+            raise
+        _timer_slack(previous_slack)
 
     def _enqueue(self, addresses, *, stream):
         if self._graphs is None:
@@ -590,7 +642,7 @@ class _HostIO:
                     ),
                     "cudaMemcpyAsync device-to-host",
                 )
-            _cuda(cudart.cudaStreamSynchronize(self.stream), "cudaStreamSynchronize")
+            self._wait()
             # Staging storage belongs to this exchange; returned values belong
             # to the caller and must survive the next exchange and close().
             outputs = {

@@ -179,7 +179,27 @@ def native_io(monkeypatch):
     fail = SimpleNamespace(enqueue=False, malloc_calls=0, free_calls=0, sync_calls=0)
     fail.host_allocations = {}
     fail.host_malloc_calls = fail.host_free_calls = 0
+    fail.events = set()
+    fail.event_flags = []
+    fail.event_records = []
+    fail.destroyed_events = []
     success = cudart.cudaError_t.cudaSuccess
+
+    def create_event(flags):
+        event = 100 + len(fail.event_flags)
+        fail.events.add(event)
+        fail.event_flags.append(flags)
+        return success, event
+
+    def record_event(event, stream):
+        assert event in fail.events
+        fail.event_records.append((event, stream))
+        return (success,)
+
+    def destroy_event(event):
+        fail.events.remove(event)
+        fail.destroyed_events.append(event)
+        return (success,)
 
     def allocate(size):
         fail.malloc_calls += 1
@@ -273,6 +293,10 @@ def native_io(monkeypatch):
     monkeypatch.setattr(cudart, "cudaStreamCreate", lambda: (success, 10))
     monkeypatch.setattr(cudart, "cudaStreamSynchronize", synchronize)
     monkeypatch.setattr(cudart, "cudaStreamDestroy", lambda stream: (success,))
+    monkeypatch.setattr(cudart, "cudaEventCreateWithFlags", create_event)
+    monkeypatch.setattr(cudart, "cudaEventRecord", record_event)
+    monkeypatch.setattr(cudart, "cudaEventQuery", lambda event: (success,))
+    monkeypatch.setattr(cudart, "cudaEventDestroy", destroy_event)
     monkeypatch.setattr(cudart, "cudaMalloc", allocate)
     monkeypatch.setattr(cudart, "cudaFree", free)
     monkeypatch.setattr(cudart, "cudaMallocHost", allocate_host)
@@ -327,7 +351,7 @@ def test_failed_execution_returns_its_outputs_and_preserves_borrowed_cache(nativ
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
-def test_failed_final_synchronization_returns_unclaimed_resident_outputs(native_io, monkeypatch):
+def test_failed_completion_cleanup_returns_unclaimed_resident_outputs(native_io, monkeypatch):
     """A retained CUDA completion error returns every output that the caller never received."""
     from cuda.bindings import runtime as cudart
 
@@ -342,6 +366,9 @@ def test_failed_final_synchronization_returns_unclaimed_resident_outputs(native_
         )
 
     monkeypatch.setattr(cudart, "cudaStreamSynchronize", synchronize)
+    monkeypatch.setattr(
+        cudart, "cudaEventQuery", lambda event: (cudart.cudaError_t.cudaErrorUnknown,)
+    )
     with pytest.raises(RuntimeError, match="cudaStreamSynchronize") as error:
         io.run({"input": np.ones((1, 4), dtype=np.float32)}, device_outputs=("kept",))
     assert error.value.__traceback__ is not None
@@ -372,10 +399,11 @@ def test_completed_inference_reuses_buffers_without_overwriting_retained_outputs
     assert not allocations
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-017")
 def test_completed_exchange_waits_for_cuda_only_once(native_io):
     """A successful exchange returns completed outputs without waiting twice for the same work."""
     io, _, _, calls, _ = native_io
     result = io.run({"input": np.ones((1, 4), dtype=np.float32)})
     np.testing.assert_array_equal(result["host"], [[2, 2, 2, 2]])
-    assert calls.sync_calls == 1
+    assert len(calls.event_records) == 1
+    assert calls.sync_calls == 0

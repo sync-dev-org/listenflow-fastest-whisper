@@ -63,6 +63,12 @@ def native(monkeypatch):
     monkeypatch.setattr(cudart, "cudaStreamCreate", create_stream)
     monkeypatch.setattr(cudart, "cudaStreamDestroy", destroy_stream)
     monkeypatch.setattr(
+        cudart,
+        "cudaEventCreateWithFlags",
+        lambda flags: (cudart.cudaError_t.cudaSuccess, next(stream_ids)),
+    )
+    monkeypatch.setattr(cudart, "cudaEventDestroy", lambda event: (cudart.cudaError_t.cudaSuccess,))
+    monkeypatch.setattr(
         cudart, "cudaStreamSynchronize", lambda stream: (cudart.cudaError_t.cudaSuccess,)
     )
     monkeypatch.setattr(_engines, "open_engine", build)

@@ -191,8 +191,8 @@ def test_load_workers_report_real_proc_usage_and_stop_after_failure():
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
-def test_wall_control_times_product_without_allocating_or_recording_events(cpu_native, monkeypatch):
-    """Observer overhead controls retain steps and product tokens without CUDA event calls."""
+def test_wall_control_times_product_without_adding_timing_events(cpu_native, monkeypatch):
+    """Whole-step observation preserves tokens and records only product completion events."""
     import numpy as np
 
     model, cu, clock, _, _ = cpu_native
@@ -202,7 +202,13 @@ def test_wall_control_times_product_without_allocating_or_recording_events(cpu_n
     def forbidden(*_args):
         raise AssertionError("event-free control used a CUDA event")
 
-    monkeypatch.setattr(cu, "cudaEventRecord", forbidden)
+    original_record = cu.cudaEventRecord
+
+    def record(event, stream):
+        assert event == model._decoder._completion
+        return original_record(event, stream)
+
+    monkeypatch.setattr(cu, "cudaEventRecord", record)
     monkeypatch.setattr(cu, "cudaEventCreate", forbidden)
     with profile.WallProfiler(model, clock=lambda: round(clock() * 1e9)) as observer:
         actual, rows = observer.capture(lambda: model.greedy_decode(encoder))
@@ -300,3 +306,49 @@ def test_schedule_is_set_only_when_requested_and_refuses_a_rejected_policy():
     cu.cudaSetDeviceFlags = lambda flag: (17,)
     with pytest.raises(RuntimeError, match="scheduling"):
         configure_schedule(cu, "spin")
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+def test_wait_observer_counts_queries_and_retains_each_actual_sleep(cpu_native, monkeypatch):
+    """Each measured decoder step retains its own query count and individual sleep durations."""
+    import itertools
+    import json
+
+    import numpy as np
+
+    from listenflow.fastest_whisper import _inference
+
+    model, cu, _, _, _ = cpu_native
+    encoder = model.encode(np.zeros((128, 3000), dtype=np.float32))
+    expected = model.greedy_decode(encoder)
+    statuses = itertools.cycle(
+        [cu.cudaError_t.cudaErrorNotReady] * 2 + [cu.cudaError_t.cudaSuccess]
+    )
+    original_query = cu.cudaEventQuery
+    sleep_clock = [0]
+    intervals = []
+
+    def sleep(interval):
+        intervals.append(interval)
+        sleep_clock[0] += len(intervals) * 100
+
+    monkeypatch.setattr(cu, "cudaEventQuery", lambda event: (next(statuses),))
+    monkeypatch.setattr(_inference, "sleep", sleep)
+    monkeypatch.setattr(profile.time, "perf_counter_ns", lambda: sleep_clock[0])
+    query_before = cu.cudaEventQuery
+    with profile.WaitProfiler(model, cu) as observer:
+        actual, rows = observer.capture(lambda: model.greedy_decode(encoder))
+    assert actual.tokens == expected.tokens
+    assert len(rows) == 5
+    assert [row["query_count"] for row in rows] == [3] * 5
+    assert [json.loads(row["sleep_ns"]) for row in rows] == [
+        [100, 200],
+        [300, 400],
+        [500, 600],
+        [700, 800],
+        [900, 1000],
+    ]
+    assert intervals == [50e-6] * 10
+    assert cu.cudaEventQuery is query_before
+    assert _inference.sleep is sleep
+    monkeypatch.setattr(cu, "cudaEventQuery", original_query)

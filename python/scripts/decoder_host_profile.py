@@ -8,6 +8,7 @@ without importing CUDA, TensorRT, NumPy, or the inference package.
 from __future__ import annotations
 
 import csv
+import json
 import math
 import multiprocessing
 import statistics
@@ -394,6 +395,16 @@ class StepProfiler:
                     self.record_copy_event(1, stream)
                 return region("d2h_sync", original_sync, stream)
 
+            if hasattr(_HostIO, "_wait"):
+                original_wait = _HostIO._wait
+
+                def wait(io):
+                    if self.detailed and self.current is not None and self.copy_started:
+                        self.record_copy_event(1, io.stream)
+                    return region("d2h_sync", original_wait, io)
+
+                self.stack.enter_context(patch.object(_HostIO, "_wait", wait))
+
             def enqueue(io, addresses, *, stream):
                 if self.current is None or io is not self.io:
                     return original_enqueue(io, addresses, stream=stream)
@@ -592,16 +603,18 @@ class WallProfiler:
 
 
 class WaitProfiler(WallProfiler):
-    """Measure thread CPU and wall time inside D2H/sync without CUDA events."""
+    """Measure D2H and completion-wait CPU/wall clocks without adding timing events."""
 
     def __init__(self, model, cudart):
         super().__init__(model)
         self.cu = cudart
         self.stack = ExitStack()
+        self.in_wait = False
 
     def __enter__(self):
         from unittest.mock import patch
 
+        from listenflow.fastest_whisper import _inference
         from listenflow.fastest_whisper._inference import _HostIO
 
         super().__enter__()
@@ -612,13 +625,19 @@ class WaitProfiler(WallProfiler):
             measured = self.active and io is self.model._decoder
             if measured:
                 self.wait_cpu = self.wait_wall = 0
+                self.query_count = 0
+                self.sleep_durations = []
                 self.wait_details = dict.fromkeys(
                     ("copy_cpu_ns", "copy_wall_ns", "sync_cpu_ns", "sync_wall_ns"), 0
                 )
             outputs = original_run(io, inputs, **kwargs)
             if measured:
                 self.rows[-1].update(
-                    wait_cpu_ns=self.wait_cpu, wait_wall_ns=self.wait_wall, **self.wait_details
+                    wait_cpu_ns=self.wait_cpu,
+                    wait_wall_ns=self.wait_wall,
+                    query_count=self.query_count,
+                    sleep_ns=json.dumps(self.sleep_durations),
+                    **self.wait_details,
                 )
             return outputs
 
@@ -630,9 +649,12 @@ class WaitProfiler(WallProfiler):
                 if not measured:
                     return function(*args)
                 cpu, wall = time.thread_time_ns(), time.perf_counter_ns()
+                if not is_copy:
+                    self.in_wait = True
                 try:
                     return function(*args)
                 finally:
+                    self.in_wait = False
                     cpu_elapsed = time.thread_time_ns() - cpu
                     wall_elapsed = time.perf_counter_ns() - wall
                     self.wait_cpu += cpu_elapsed
@@ -643,11 +665,34 @@ class WaitProfiler(WallProfiler):
 
             return call
 
+        original_query = self.cu.cudaEventQuery
+
+        def query(*args):
+            if self.active and self.in_wait:
+                self.query_count += 1
+            return original_query(*args)
+
+        original_sleep = getattr(_inference, "sleep", None)
+
+        def sleep(interval):
+            if not self.active or not self.in_wait:
+                return original_sleep(interval)
+            started = time.perf_counter_ns()
+            try:
+                return original_sleep(interval)
+            finally:
+                self.sleep_durations.append(time.perf_counter_ns() - started)
+
         self.stack.enter_context(patch.object(_HostIO, "run", run))
+        self.stack.enter_context(patch.object(self.cu, "cudaEventQuery", query))
+        if original_sleep is not None:
+            self.stack.enter_context(patch.object(_inference, "sleep", sleep))
         for name, is_copy in (("cudaMemcpyAsync", True), ("cudaStreamSynchronize", False)):
             self.stack.enter_context(
                 patch.object(self.cu, name, wrap(getattr(self.cu, name), is_copy))
             )
+        if hasattr(_HostIO, "_wait"):
+            self.stack.enter_context(patch.object(_HostIO, "_wait", wrap(_HostIO._wait, False)))
         return self
 
     def __exit__(self, *_exc):
