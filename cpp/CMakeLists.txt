@@ -52,7 +52,7 @@ if(BUILD_TESTING)
     add_library(lffw_qkv_driver_observer SHARED tests/qkv_driver_observer.cpp)
     target_compile_features(lffw_qkv_driver_observer PRIVATE cxx_std_17)
     target_link_libraries(lffw_qkv_driver_observer PRIVATE
-        tensoracle_internal_cuda_driver Threads::Threads ${CMAKE_DL_LIBS})
+        tensoracle_cuda_driver Threads::Threads ${CMAKE_DL_LIBS})
 
     tensoracle_add_cubin_plugin(
         TARGET lffw_qkv_v1_fixture

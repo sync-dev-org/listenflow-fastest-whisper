@@ -461,7 +461,7 @@ requires-dist = [
     { name = "listenflow", specifier = ">=0.17.6" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "safetensors", specifier = ">=0.4" },
-    { name = "tensoracle", specifier = "==1.3.0" },
+    { name = "tensoracle", specifier = "==1.4.0" },
     { name = "tensorrt-cu13", specifier = ">=11.0" },
     { name = "tokenizers", specifier = ">=0.22" },
 ]
@@ -469,7 +469,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 cubin = [
     { name = "nvidia-cuda-runtime", specifier = "==13.2.86" },
-    { name = "tensoracle", extras = ["producer"], specifier = "==1.3.0" },
+    { name = "tensoracle", extras = ["producer"], specifier = "==1.4.0" },
 ]
 dev = [
     { name = "pytest", specifier = ">=8.0" },
@@ -1049,16 +1049,16 @@ wheels = [
 
 [[package]]
 name = "tensoracle"
-version = "1.3.0"
+version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "safetensors" },
     { name = "tensorrt-cu13" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b2/78/fec5c2f1f2e52c04dc4561d8e7ac439854fe9bd6717a0ebecdb305de1add/tensoracle-1.3.0.tar.gz", hash = "sha256:e89007d9cd929a34d26a63a78b6468e9a449152b8265737a250db41fc99fc800", size = 237498, upload-time = "2026-10-27T05:11:21.226Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/53/89/a94493c95a32bbaa22bf7425cdad5296294ef5e77584a100567586927035/tensoracle-1.4.0.tar.gz", hash = "sha256:fe5f137438aba1f413f28e42406e208a1da259334289384ac7a9a0026c47cad9", size = 241749, upload-time = "2026-10-27T16:32:17.76Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5b/3a/aa7c44c1c4cb1a09eafd9b8de8e239b501cd925a8d25a9bff0a82ffaeff8/tensoracle-1.3.0-py3-none-any.whl", hash = "sha256:f37785e823eec2e3ae1cc465bf33e6d20a0d0be2e02882bf5708aa054fd86dbb", size = 48505, upload-time = "2026-10-27T05:11:19.599Z" },
+    { url = "https://files.pythonhosted.org/packages/45/4b/7f2f22bd8337d570a2e0f76db5f322b0c5999c070600e5c1aa1482486aea/tensoracle-1.4.0-py3-none-any.whl", hash = "sha256:1c13d1a8e1e344430a72d469251afeb5422c299027ea11217c0ba15068552834", size = 49656, upload-time = "2026-10-27T16:32:15.921Z" },
 ]
 
 [package.optional-dependencies]
