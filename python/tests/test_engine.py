@@ -96,7 +96,7 @@ def native(monkeypatch):
         yield install
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_engine_requires_and_validates_its_public_configuration(tmp_path):
     """Invalid engine settings are rejected as configuration errors before recognition."""
     from listenflow.fastest_whisper import FastestWhisperEngine
@@ -129,6 +129,7 @@ def test_engine_requires_and_validates_its_public_configuration(tmp_path):
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-008")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("value", [False, True, 1])
 def test_engine_rejects_caller_selected_cache_rebuild(tmp_path, value):
     """Engine construction has no setting for rebuilding saved TensorRT engines."""
@@ -137,6 +138,7 @@ def test_engine_rejects_caller_selected_cache_rebuild(tmp_path, value):
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-009")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_initial_prompt_configuration_accepts_long_and_whitespace_hints(tmp_path):
     """The engine rejects empty and nontext hints while accepting text of any token length."""
     assert _engine(tmp_path, initial_prompt="  ").initial_prompt == "  "
@@ -148,6 +150,7 @@ def test_initial_prompt_configuration_accepts_long_and_whitespace_hints(tmp_path
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-009")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("prompt", [None, "Quetzalcoatl"])
 def test_health_reports_hint_only_after_a_successful_decode(tmp_path, native, prompt):
     """Each stream reports its configured hint and whether a decode received it."""
@@ -175,7 +178,7 @@ def test_health_reports_hint_only_after_a_successful_decode(tmp_path, native, pr
     assert second.session_id > first.session_id
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_capabilities_match_accepted_languages_and_are_static(tmp_path):
     """The engine accepts exactly its declared language codes plus automatic detection."""
     english = _engine(tmp_path)
@@ -195,7 +198,7 @@ def test_capabilities_match_accepted_languages_and_are_static(tmp_path):
     }
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_stream_requires_prepare_and_health_records_progress(tmp_path, native):
     """Recognition requires preparation and reports PCM and completed-decode progress."""
     model = native(_Model())
@@ -238,7 +241,7 @@ def test_stream_requires_prepare_and_health_records_progress(tmp_path, native):
     assert len(model.audio) == 1
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("text", [None, "", "   "])
 def test_silent_decode_closes_utterance_without_text_events(tmp_path, native, text):
     """A spoken interval with no recognized text still has a start and end."""
@@ -252,7 +255,7 @@ def test_silent_decode_closes_utterance_without_text_events(tmp_path, native, te
     assert (events[0].ts_offset_s, events[1].ts_offset_s) == (0, 0.01)
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_automatic_language_rejects_non_english_and_recovers(tmp_path, native):
     """An unsupported detected language is a configuration error and permits reuse."""
     from listenflow.fastest_whisper import UnsupportedLanguageError
@@ -277,6 +280,7 @@ def test_automatic_language_rejects_non_english_and_recovers(tmp_path, native):
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-008")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("error_type", [CorruptEngineError, EngineConditionError, EngineIOError])
 def test_prepare_preserves_cache_failure_without_caller_rebuild_guidance(
     tmp_path, native, monkeypatch, error_type
@@ -297,7 +301,7 @@ def test_prepare_preserves_cache_failure_without_caller_rebuild_guidance(
     assert "force_rebuild" not in str(failure.value)
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize(
     "cause", [OSError("checkpoint unavailable"), RuntimeError("native build failed")]
 )
@@ -326,7 +330,7 @@ def test_prepare_maps_native_loading_errors_and_can_retry(tmp_path, native, monk
     assert engine.health().state is EngineState.READY
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_failed_warmup_returns_resources_before_retry(tmp_path, native):
     """A failed trial inference returns its model before preparation is retried."""
     cause = RuntimeError("native warmup failed")
@@ -349,7 +353,7 @@ def test_failed_warmup_returns_resources_before_retry(tmp_path, native):
     assert engine.health().state is EngineState.READY
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_second_stream_is_rejected_while_first_continues(tmp_path, native):
     """Concurrent streams are refused without closing the earlier stream."""
     native(_Model())
@@ -378,7 +382,7 @@ def test_second_stream_is_rejected_while_first_continues(tmp_path, native):
     assert isinstance(_collect(native, engine, speech)[-1], UtteranceEnd)
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("detected", [False, True])
 def test_decode_failure_preserves_native_cause_and_permits_reuse(tmp_path, native, detected):
     """A native transcription or language-detector failure maps to an inference error."""
@@ -404,7 +408,7 @@ def test_decode_failure_preserves_native_cause_and_permits_reuse(tmp_path, nativ
     assert isinstance(_collect(native, engine, speech)[-1], UtteranceEnd)
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_f32_pcm_reaches_decoder_as_little_endian_samples(tmp_path, native):
     """The selected f32 PCM input reaches the model without integer scaling."""
     model = native(_Model())
@@ -414,7 +418,7 @@ def test_f32_pcm_reaches_decoder_as_little_endian_samples(tmp_path, native):
     np.testing.assert_array_equal(model.audio[0], samples)
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize(
     "problem", ["cuda", "device", "capability", "tensorrt_import", "tensorrt_os"]
 )
@@ -461,7 +465,7 @@ def test_prepare_reports_runtime_unavailability_before_loading(
     assert engine.health().state is EngineState.UNPREPARED
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_failed_preparation_maps_cleanup_failure_and_keeps_both_causes(tmp_path, native):
     """A native cleanup failure after failed preparation is a core error with both native causes."""
     load_error = RuntimeError("trial inference failed")
@@ -488,7 +492,7 @@ def test_failed_preparation_maps_cleanup_failure_and_keeps_both_causes(tmp_path,
     assert not engine.health().busy
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("error_type", [ImportError, OSError])
 def test_prepare_maps_native_binding_import_failure_before_allocating(
     tmp_path, native, monkeypatch, error_type

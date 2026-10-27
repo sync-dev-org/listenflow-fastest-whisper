@@ -9,12 +9,20 @@ foreach(root IN ITEMS TENSORACLE_CPP_ROOT TENSORRT_ROOT LFFW_BUNDLE_ROOT)
         message(FATAL_ERROR "Set ${root} to the verified build input")
     endif()
 endforeach()
+if(NOT CUDAToolkit_ROOT)
+    find_path(CUDAToolkit_ROOT NAMES include/cuda.h
+        HINTS ENV CUDAToolkit_ROOT
+        PATHS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES nvidia/cu13
+        NO_DEFAULT_PATH REQUIRED)
+endif()
 include("${TENSORACLE_CPP_ROOT}/cmake/TensoracleCubinPlugin.cmake")
+find_package(Threads REQUIRED)
 tensoracle_add_cubin_plugin(
     TARGET lffw_fc1_plugin
     TENSORRT_ROOT "${TENSORRT_ROOT}"
     BUNDLE_ROOT "${LFFW_BUNDLE_ROOT}"
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/fc1_registration.cpp" "${CMAKE_CURRENT_LIST_DIR}/fc1_plugin.cpp")
+target_link_libraries(lffw_fc1_plugin PRIVATE Threads::Threads)
 set_target_properties(lffw_fc1_plugin PROPERTIES SKIP_BUILD_RPATH TRUE)
 
 include(CTest)
@@ -25,6 +33,7 @@ if(BUILD_TESTING)
         BUNDLE_ROOT "${LFFW_BUNDLE_ROOT}"
         SOURCES "${CMAKE_CURRENT_LIST_DIR}/plugin.cpp" "${CMAKE_CURRENT_LIST_DIR}/qkv_plugin.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/fc1_plugin.cpp")
+    target_link_libraries(lffw_cubin_plugin PRIVATE Threads::Threads)
     set_target_properties(lffw_cubin_plugin PROPERTIES SKIP_BUILD_RPATH TRUE)
     find_program(LFFW_NM nm REQUIRED)
     find_program(LFFW_READELF readelf REQUIRED)
@@ -42,12 +51,14 @@ if(BUILD_TESTING)
     # It is never linked into the production library.
     add_library(lffw_qkv_driver_observer SHARED tests/qkv_driver_observer.cpp)
     target_compile_features(lffw_qkv_driver_observer PRIVATE cxx_std_17)
-    target_link_libraries(lffw_qkv_driver_observer PRIVATE CUDA::cuda_driver ${CMAKE_DL_LIBS})
+    target_link_libraries(lffw_qkv_driver_observer PRIVATE
+        tensoracle_internal_cuda_driver Threads::Threads ${CMAKE_DL_LIBS})
 
     tensoracle_add_cubin_plugin(
         TARGET lffw_qkv_v1_fixture
         TENSORRT_ROOT "${TENSORRT_ROOT}"
         BUNDLE_ROOT "${LFFW_BUNDLE_ROOT}"
         SOURCES "${CMAKE_CURRENT_LIST_DIR}/tests/qkv_v1_fixture.cpp")
+    target_link_libraries(lffw_qkv_v1_fixture PRIVATE Threads::Threads)
     set_target_properties(lffw_qkv_v1_fixture PROPERTIES SKIP_BUILD_RPATH TRUE)
 endif()

@@ -151,7 +151,7 @@ def _texts(runner, engine, *, seconds=1, utterances=1):
     return runner.run(collect())
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize(
     "changed",
     [
@@ -183,7 +183,7 @@ def test_omitted_decoding_options_keep_the_existing_defaults(tmp_path, runtime, 
         runner.run(explicit.aclose())
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize(
     ("precision", "seconds", "prompt"),
     [
@@ -206,7 +206,7 @@ def test_selected_beam_changes_stream_text(tmp_path, runtime, precision, seconds
         runner.run(beam.aclose())
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize(("best_of", "expected"), [(1, "B"), (2, "A C")])
 def test_positive_temperature_selects_the_requested_number_of_candidates(
     tmp_path, runtime, best_of, expected
@@ -219,7 +219,7 @@ def test_positive_temperature_selects_the_requested_number_of_candidates(
         runner.run(engine.aclose())
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize(
     ("temperature", "expected"),
     [
@@ -239,7 +239,7 @@ def test_failed_quality_retries_in_the_selected_temperature_order(
         runner.run(engine.aclose())
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize(
     ("threshold", "value", "expected"),
     [
@@ -273,7 +273,7 @@ def test_each_threshold_changes_or_disables_its_check_in_stream_results(
         runner.run(engine.aclose())
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_temperature_list_is_copied_for_all_utterances_and_streams(tmp_path, runtime):
     """Mutating the caller's list cannot change the engine's later utterances or streams."""
     runtime(by_temperature=True)
@@ -319,7 +319,7 @@ INVALID = [
 ]
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize(("name", "value"), INVALID)
 def test_invalid_decoding_values_fail_when_constructing_the_engine(tmp_path, name, value):
     """Invalid decoding settings raise ConfigurationError without preparation or GPU access."""
@@ -327,7 +327,7 @@ def test_invalid_decoding_values_fail_when_constructing_the_engine(tmp_path, nam
         _engine(tmp_path, **{name: value})
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("temperature", [0, 0.4, 2.0, [0, 0.4], (0.4, 0.0)])
 def test_valid_decoding_values_have_no_additional_numeric_limits(tmp_path, temperature):
     """Scalar and sequence temperatures and disabled thresholds are accepted without a GPU."""
@@ -374,6 +374,7 @@ def test_numerical_entries_keep_their_decoding_error_types(entry_name, name, val
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize(
     "entry_name",
     [

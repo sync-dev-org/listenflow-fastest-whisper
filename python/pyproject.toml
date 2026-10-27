@@ -21,7 +21,7 @@ dependencies = [
     "listenflow>=0.17.6",
     "numpy>=2.0",
     "safetensors>=0.4",
-    "tensoracle==1.1.0",
+    "tensoracle==1.3.0",
     "tensorrt-cu13>=11.0",
     "tokenizers>=0.22",
 ]
@@ -30,7 +30,12 @@ dependencies = [
 Repository = "https://github.com/sync-dev-org/listenflow-fastest-whisper"
 
 [build-system]
-requires = ["scikit-build-core>=1.0,<2", "setuptools-scm>=9,<11"]
+requires = [
+    "scikit-build-core>=1.0,<2",
+    "setuptools-scm>=9,<11",
+    "nvidia-cuda-runtime==13.2.86",
+    "nvidia-cuda-crt==13.2.86",
+]
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
@@ -50,7 +55,6 @@ BUILD_TESTING = false
 TENSORACLE_CPP_ROOT = { env = "TENSORACLE_CPP_ROOT", default = "" }
 TENSORRT_ROOT = { env = "TENSORRT_ROOT", default = "" }
 LFFW_BUNDLE_ROOT = { env = "LFFW_BUNDLE_ROOT", default = "" }
-CUDAToolkit_ROOT = { env = "CUDAToolkit_ROOT", default = "/usr/local/cuda" }
 
 [[tool.scikit-build.overrides]]
 if.state = "editable"
@@ -83,7 +87,7 @@ describe_command = [
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.8"]
 oracle = ["openai-whisper==20250625", "torch>=2.0"]
-cubin = ["tensoracle[producer]==1.1.0"]
+cubin = ["tensoracle[producer]==1.3.0", "nvidia-cuda-runtime==13.2.86"]
 evaluation = [
     "ctranslate2",
     "faster-whisper==1.2.1",

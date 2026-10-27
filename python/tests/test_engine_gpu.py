@@ -154,6 +154,7 @@ def _damage_saved_plugin(path, damage):
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-002")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_fp32_engine_stream_matches_official_text(gpu, engine_loop):
     """The fp32 engine emits the official greedy text through the core event stream."""
     pcm = _pcm("small_boat_16khz_mono_s16le.wav")
@@ -166,6 +167,7 @@ def test_fp32_engine_stream_matches_official_text(gpu, engine_loop):
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-002")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("prompt", [None, "the"])
 def test_fp32_engine_stream_uses_selected_beam_with_or_without_a_hint(gpu, engine_loop, prompt):
     """The selected beam emits the official text, including when a hint supplies context."""
@@ -185,6 +187,7 @@ def test_fp32_engine_stream_uses_selected_beam_with_or_without_a_hint(gpu, engin
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-002")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_long_engine_stream_uses_selected_beam_and_hint(gpu, engine_loop):
     """Long hinted utterances use the chosen beam and retain official text and offsets."""
     oracle = json.loads((FIXTURES / "oracle" / "beam_long_with_prompt.json").read_text())
@@ -204,6 +207,7 @@ def test_long_engine_stream_uses_selected_beam_and_hint(gpu, engine_loop):
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-003")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_fp16_engine_stream_uses_selected_sampling_and_retry_settings(
     gpu, engine_loop, monkeypatch
 ):
@@ -234,6 +238,7 @@ def test_fp16_engine_stream_uses_selected_sampling_and_retry_settings(
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-009")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_engine_stream_uses_hint_and_reports_its_application(gpu, engine_loop):
     """A configured hint changes recognized text and health reports its use."""
     pcm = _pcm("small_boat_16khz_mono_s16le.wav")
@@ -251,6 +256,7 @@ def test_engine_stream_uses_hint_and_reports_its_application(gpu, engine_loop):
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-003")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_fp16_engine_stream_matches_fp16_entry(gpu, engine_loop):
     """The fp16 engine presents the same text as the fp16 correctness entry."""
     pcm = _pcm("small_boat_16khz_mono_s16le.wav")
@@ -262,6 +268,7 @@ def test_fp16_engine_stream_matches_fp16_entry(gpu, engine_loop):
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-009")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_fp16_engine_accepts_a_hint_and_completes_transcription(gpu, engine_loop):
     """The fp16 stream can decode with a configured hint without a quality assertion."""
     engine = _engine(gpu, precision="fp16", initial_prompt="the")
@@ -273,7 +280,7 @@ def test_fp16_engine_accepts_a_hint_and_completes_transcription(gpu, engine_loop
 
 
 @pytest.mark.gpu
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_long_utterance_matches_long_fp32_segments(gpu, engine_loop, monkeypatch):
     """A continuous utterance over 30 seconds keeps long-form text and source offsets."""
     factory = np.random.default_rng
@@ -292,7 +299,7 @@ def test_long_utterance_matches_long_fp32_segments(gpu, engine_loop, monkeypatch
 
 
 @pytest.mark.gpu
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_auto_detects_english_and_rejects_japanese(gpu, engine_loop):
     """Automatic detection transcribes English and reports the official Japanese code."""
     english = _pcm("small_boat_16khz_mono_s16le.wav")
@@ -310,6 +317,7 @@ def test_auto_detects_english_and_rejects_japanese(gpu, engine_loop):
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-010")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_nonzero_device_is_used_when_visible(gpu, monkeypatch, engine_loop):
     """The selected nonzero CUDA device builds and transcribes when present."""
     count, _ = _cuda_device_info(1)
@@ -341,6 +349,7 @@ def test_nonzero_device_is_used_when_visible(gpu, monkeypatch, engine_loop):
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-008")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_cached_engines_reuse_and_automatically_recover_across_processes(
     gpu, tmp_path, monkeypatch
 ):
@@ -442,7 +451,7 @@ asyncio.run(run())
 
 
 @pytest.mark.gpu
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("release", ["aclose", "async_with", "drop_prepared", "drop_streamed"])
 def test_engine_returns_gpu_memory_without_cyclic_collection(gpu, engine_loop, release):
     """Closing or dropping an engine after preparation or streaming returns GPU memory without gc."""

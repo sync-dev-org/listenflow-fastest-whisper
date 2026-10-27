@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -124,6 +125,64 @@ def test_native_plugin_embeds_the_bundle_and_passes_registration_checks(native_p
         check=False,
     )
     assert checked.returncode == 0, checked.stdout + checked.stderr
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-007")
+@pytest.mark.req("SP-LFFASTESTWHISPER-033")
+def test_native_build_and_ctest_without_the_system_cuda_toolkit(bundle, tmp_path):
+    """Wheel headers and the driver suffice when /usr/local and toolkit variables are absent."""
+    sdk = os.environ.get("TENSORRT_ROOT")
+    if not sdk:
+        pytest.skip("set TENSORRT_ROOT to a verified TensorRT SDK for the native build")
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        pytest.skip("install bubblewrap to verify the build with /usr/local hidden")
+    isolated = [
+        bwrap,
+        "--bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--tmpfs",
+        "/usr/local",
+        "--unsetenv",
+        "CUDA_HOME",
+        "--unsetenv",
+        "CUDA_PATH",
+        "--unsetenv",
+        "CUDAToolkit_ROOT",
+        "--unsetenv",
+        "CUDACXX",
+        "--unsetenv",
+        "LD_LIBRARY_PATH",
+        "--setenv",
+        "PATH",
+        "/usr/bin:/bin",
+    ]
+    build = tmp_path / "native"
+    commands = [
+        [
+            sys.executable,
+            str(ROOT / "cpp/build_native.py"),
+            "--bundle-dir",
+            str(bundle),
+            "--build-dir",
+            str(build),
+            "--tensorrt-root",
+            sdk,
+        ],
+        ["ctest", "--test-dir", str(build), "--output-on-failure", "--no-tests=error"],
+    ]
+    for command in commands:
+        result = subprocess.run(
+            [*isolated, *command], capture_output=True, text=True, timeout=180, check=False
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+    assert inspect_bundle(bundle, plugin=build / "liblffw_fc1_plugin.so") == inspect_bundle(bundle)
 
 
 @pytest.fixture(scope="module")

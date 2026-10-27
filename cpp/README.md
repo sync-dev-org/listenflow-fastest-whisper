@@ -125,22 +125,24 @@ the caller. Product builder settings and timing-cache behavior are unchanged.
 ## Prerequisites
 
 Use a standalone checkout on Linux x86_64, including WSL2. Install Python
-`>=3.12,<3.14`, uv, a C++17 compiler, CMake 3.20 or later, Ninja, the CUDA toolkit,
+`>=3.12,<3.14`, uv, a C++17 compiler, CMake 3.20 or later, Ninja, the NVIDIA driver,
 and binutils (`nm`, `readelf`). CMake and Ninja are build tools installed on the
-host; they are not Python project dependencies. These commands use CUDA at
-`/usr/local/cuda`; pass `--cuda-root` for another toolkit location.
+host; they are not Python project dependencies. CUDA headers and producer tools
+come from the locked NVIDIA PyPI packages; an OS-installed CUDA Toolkit is not
+needed. The native build links the driver's `libcuda.so` (on WSL2, in
+`/usr/lib/wsl/lib`). The driver library must also be available on native Linux.
 
 Install the Python tooling from the repository root, keeping the environment in
 `python/.venv`:
 
 ```bash
-(cd python && uv sync --group cubin --locked)
+(cd python && uv sync --group dev --group cubin --locked)
 ```
 
-The lock supplies tensoracle 1.1.0, Triton 3.8.0, ptxas 12.9.86 and cuobjdump
-13.3.73. Cubin production uses tensoracle's pinned NVIDIA wheel tools, rather
-than the toolkit's ptxas, and does not use a GPU. A fresh producer process must
-not import torch. The build finds tensoracle's C++ helper inside the installed
+The lock supplies tensoracle 1.3.0, Triton 3.8.0, and the CUDA 13.2.86 NVIDIA
+packages: runtime and CRT headers, nvcc/ptxas, NVVM, and cuobjdump. Cubin production
+uses tensoracle's pinned NVIDIA wheel tools and does not use a GPU. A fresh
+producer process must not import torch. The build finds tensoracle's C++ helper inside the installed
 Python package; it does not require a tensoracle source checkout.
 
 ## Prepare and verify the build SDK
@@ -230,7 +232,8 @@ the bundle digest. Generated bundles and the shared library belong under
 processes and compares every output byte, including the embedded C++ source.
 
 The build script checks the input bundle, resolves the installed tensoracle C++
-helper, invokes CMake and Ninja, and checks that the resulting
+helper and the PyPI `nvidia/cu13` header root, invokes CMake and Ninja, and checks
+that the resulting
 `build/cubin-plugin/liblffw_fc1_plugin.so` and the development library embed the
 same bundle. CTest checks both libraries'
 `getCreators`, `setLoggerFinder`, and the exported bundle identity with `nm`, and
@@ -244,13 +247,21 @@ CMake itself does not discover Python or nanobind:
 ```bash
 TENSORACLE_CPP_ROOT="$(cd python && uv run --locked python -c \
   'from pathlib import Path; import tensoracle; print(Path(tensoracle.__file__).parent / "cpp")')"
+CUDAToolkit_ROOT="$(cd python && uv run --group cubin --locked python -c \
+  'from importlib.metadata import distribution; print(distribution("nvidia-cuda-runtime").locate_file("nvidia/cu13"))')"
 cmake -S cpp -B build/cubin-plugin -G Ninja \
-  -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DCUDAToolkit_ROOT=/usr/local/cuda \
+  -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DCUDAToolkit_ROOT="$CUDAToolkit_ROOT" \
   -DTENSORACLE_CPP_ROOT="$TENSORACLE_CPP_ROOT" -DTENSORRT_ROOT="$TENSORRT_ROOT" \
   -DLFFW_BUNDLE_ROOT="$(pwd)/build/cubin-bundle"
 cmake --build build/cubin-plugin --parallel 2
 ctest --test-dir build/cubin-plugin --output-on-failure --no-tests=error
 ```
+
+`--cuda-root` overrides the header root for `build_native.py`. Direct CMake
+builds use `CUDAToolkit_ROOT` (a CMake variable or environment variable). Wheel
+builds also search scikit-build-core's build environment for `nvidia/cu13`.
+Neither default searches an OS toolkit. To link a driver installed outside the
+usual Linux library directories, pass its directory in `CMAKE_LIBRARY_PATH`.
 
 ## Validate engines
 
@@ -319,7 +330,7 @@ isolated layer do not establish product decoder latency or transcription quality
 
 The scikit-build-core backend builds `lffw_fc1_plugin` with testing disabled and
 installs only `liblffw_fc1_plugin.so` in `listenflow/fastest_whisper/`. It needs
-the verified SDK, tensoracle helper, generated bundle, and CUDA toolkit. It adds
+the verified SDK, tensoracle helper, generated bundle, and NVIDIA driver. It adds
 no Python binding. From `python/`, set the CMake inputs and build:
 
 ```bash
@@ -336,6 +347,9 @@ The distribution tests need these same inputs. The source archive carries
 extracted directory can build a wheel with the same verified SDK, tensoracle
 helper, and generated bundle; no sibling checkout is needed. Generated cubins,
 engine plans, test audio, and development dependencies are absent from the wheel.
+The isolated build installs `nvidia-cuda-runtime==13.2.86` and
+`nvidia-cuda-crt==13.2.86` for their headers. They are build dependencies and do
+not add runtime requirements or NVIDIA libraries to the wheel.
 
 An editable `uv sync` registers the Python source without compiling C++. Its
 source-only lookup uses the independently built `build/cubin-plugin/` library.

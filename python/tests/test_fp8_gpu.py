@@ -24,6 +24,7 @@ pytest_plugins = ("test_engine_gpu",)
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-004")
 @pytest.mark.req("SP-LFFASTESTWHISPER-010")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize(
     "options,repeats",
     [

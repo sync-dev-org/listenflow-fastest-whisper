@@ -20,6 +20,7 @@ def engine(tmp_path, precision="fp8"):
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-010")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_fp8_is_an_explicit_precision_and_unknown_values_are_rejected(tmp_path):
     """Selecting fp8 retains fp8 and all default decoding options; unknown values fail."""
     selected = engine(tmp_path)
@@ -31,6 +32,7 @@ def test_fp8_is_an_explicit_precision_and_unknown_values_are_rejected(tmp_path):
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-013")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 def test_prepare_rejects_fp8_on_sm86_before_loading_or_warming(tmp_path, monkeypatch):
     """sm86 preparation reports unsupported fp8 and offers fp16/fp32 without loading engines."""
     from listenflow.fastest_whisper import _engine

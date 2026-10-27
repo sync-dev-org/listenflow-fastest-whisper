@@ -132,7 +132,7 @@ async def _chunks(samples=160):
     yield np.full(samples, 1000, dtype="<i2").tobytes()
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("stop", ["caller", "iterator", "engine"])
 @pytest.mark.parametrize("samples", [160, 480_160])
 def test_cancellation_waits_for_native_token_and_starts_no_next_token(
@@ -184,7 +184,7 @@ def test_cancellation_waits_for_native_token_and_starts_no_next_token(
     asyncio.run(run())
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
 @pytest.mark.parametrize("stop", ["caller", "engine"])
 def test_cancelled_prepare_waits_and_returns_warmup_resources(tmp_path, token_runtime, stop):
     """Cancellation during trial inference waits for native completion and discards its model."""

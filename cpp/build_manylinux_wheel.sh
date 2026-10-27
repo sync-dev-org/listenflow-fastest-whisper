@@ -26,7 +26,7 @@ PY
     export CUDAToolkit_ROOT=/cuda TENSORRT_ROOT=/sdk
     export TENSORACLE_CPP_ROOT=/tensoracle-cpp LFFW_BUNDLE_ROOT=/bundle
     python -c 'from scikit_build_core.build import build_wheel; print(build_wheel("/release/raw"))'
-    export LD_LIBRARY_PATH=/sdk/lib:/cuda/lib64/stubs
+    export LD_LIBRARY_PATH=/sdk/lib:/cuda/lib
     auditwheel show /release/raw/*.whl > /release/auditwheel-raw.txt
     auditwheel repair --only-plat --plat manylinux_2_28_x86_64 \
         --exclude libcuda.so.1 --exclude libnvinfer.so.11 \
@@ -44,7 +44,6 @@ PY
         make --version
         python --version
         auditwheel --version
-        /cuda/bin/nvcc --version
         python -m pip freeze --path /tmp/backend
     } > /release/build-tools.txt
     exit
@@ -53,12 +52,21 @@ fi
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 release=$(realpath -m "${1:?Pass a new output directory}")
 sdk=$(realpath "${TENSORRT_ROOT:?Set TENSORRT_ROOT to the verified SDK}")
-cuda=$(realpath "${CUDAToolkit_ROOT:-/usr/local/cuda}")
 image=$(cat "$repo/cpp/manylinux-image.txt")
 [[ "$image" =~ @sha256:[0-9a-f]{64}$ ]]
 mkdir -p "$(dirname "$release")"
 mkdir "$release"
 cd "$repo/python"
+cuda=$(uv run --group cubin --locked python -c \
+    'import os; from importlib.metadata import distribution; from pathlib import Path; print(Path(os.environ.get("CUDAToolkit_ROOT") or distribution("nvidia-cuda-runtime").locate_file("nvidia/cu13")).resolve())')
+if [[ -n "${LFFW_CUDA_DRIVER_LIBRARY:-}" ]]; then
+    driver=$(realpath "$LFFW_CUDA_DRIVER_LIBRARY")
+elif [[ -r /usr/lib/wsl/lib/libcuda.so.1 ]]; then
+    driver=/usr/lib/wsl/lib/libcuda.so.1
+else
+    driver=$(ldconfig -p | awk '/libcuda.so.1 .*x86-64/ && !found {print $NF; found=1}')
+    driver=$(realpath "${driver:?Set LFFW_CUDA_DRIVER_LIBRARY to the NVIDIA driver libcuda.so.1}")
+fi
 df -h / > "$release/disk-before.txt"
 git rev-parse HEAD > "$release/source-revision.txt"
 git diff --binary HEAD > "$release/source.patch"
@@ -87,7 +95,10 @@ PY
     uv --version
     cmake --version
     ninja --version
+    uv run --group cubin --locked python -c \
+        'from importlib.metadata import version; print("\n".join(f"{name}=={version(name)}" for name in ("tensoracle", "nvidia-cuda-runtime", "nvidia-cuda-crt", "nvidia-cuda-nvcc", "nvidia-cuda-cuobjdump", "nvidia-nvvm")))'
 } > "$release/host-tools.txt"
+sha256sum "$driver" > "$release/cuda-driver.sha256"
 uv build --sdist --out-dir "$release"
 uv run --locked python - "$release" <<'PY'
 import sys, tomllib
@@ -102,13 +113,15 @@ docker pull "$image"
 docker buildx imagetools inspect --raw "$image" > "$release/image-manifest.json"
 docker image inspect "$image" --format \
     '{{json .RepoDigests}} {{.Id}} {{.Architecture}} {{.Os}}' > "$release/image.txt"
-docker run --rm --user "$(id -u):$(id -g)" \
+docker run --rm --cpus 2 --memory 16g --user "$(id -u):$(id -g)" \
     --mount "type=bind,src=$release,dst=/release" \
     --mount "type=bind,src=$repo/cpp/build_manylinux_wheel.sh,dst=/build.sh,readonly" \
     --mount "type=bind,src=$release/bundle,dst=/bundle,readonly" \
     --mount "type=bind,src=$helper,dst=/tensoracle-cpp,readonly" \
     --mount "type=bind,src=$sdk,dst=/sdk,readonly" \
-    --mount "type=bind,src=$cuda,dst=/cuda,readonly" \
+    --mount "type=bind,src=$cuda/include,dst=/cuda/include,readonly" \
+    --mount "type=bind,src=$driver,dst=/cuda/lib/libcuda.so,readonly" \
+    --mount "type=bind,src=$driver,dst=/cuda/lib/libcuda.so.1,readonly" \
     "$image" bash /build.sh --inside > "$release/build.log" 2>&1
 uv run --group cubin --locked python - "$release" <<'PY'
 import sys

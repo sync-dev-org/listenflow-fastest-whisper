@@ -6,7 +6,7 @@ The plugin does not use the Python C API, so the inspected wheel uses
 `py3-none-manylinux_2_28_x86_64`. CUDA 13 driver support and the declared
 `tensorrt-cu13` dependency are additional runtime requirements.
 
-Prepare the verified SDK and host CUDA toolkit using [README.md](README.md).
+Prepare the verified SDK and locked NVIDIA PyPI packages using [README.md](README.md).
 Keep host CMake, Ninja, binutils, Docker, and uv available. Use a clean release
 commit bearing the exact version tag. The Python backend preserves that version
 in the source archive. Untagged commits use `0.0.0.dev0` for development checks.
@@ -20,16 +20,24 @@ bash ../cpp/build_manylinux_wheel.sh ../dist/release
 
 The output directory must be new. The script produces the cubin bundle without
 a GPU, builds the source archive, and compiles that archive inside the exact
-manylinux image recorded in `manylinux-image.txt`. It mounts the SDK, toolkit,
-and installed tensoracle C++ helper read-only. It does not mount GPU devices or
+manylinux image recorded in `manylinux-image.txt`. It mounts the SDK, PyPI CUDA
+headers, NVIDIA driver link library, and installed tensoracle C++ helper
+read-only. It does not mount GPU devices or
 depend on another repository. The container supplies CMake and GNU Make; the
 script does not install CMake or Ninja into the Python environment.
 The script removes each container after execution. Remove the image when its
 verification is complete if the development host needs the disk space.
 
+The CUDA header root defaults to the installed `nvidia-cuda-runtime` package's
+`nvidia/cu13` directory; `CUDAToolkit_ROOT` can override it. The script finds
+`libcuda.so.1` under `/usr/lib/wsl/lib` or through the native Linux loader's
+cache. Set `LFFW_CUDA_DRIVER_LIBRARY` to its absolute path for another location.
+The container receives only `include/` and the driver library at `/cuda`; no OS
+toolkit or GPU device is needed. The driver remains external to the final wheel.
+
 The output directory records the source revision and patch, complete archive
 source manifest, image manifest/configuration digests and architecture, locked
-Python dependencies, hash-pinned build dependencies, SDK checksums, bundle
+Python dependencies, hash-pinned build dependencies, SDK and driver checksums, bundle
 digest, compiler/linker/CMake/Make/Python/CUDA/backend versions, build log,
 artifact hashes, disk measurements, and raw and final ELF/auditwheel reports.
 The CMake settings are Release, `BUILD_TESTING=OFF`, Unix Makefiles, two build
@@ -49,6 +57,9 @@ with all nine cubins, including fc1 for sm86, sm89, and sm120.
 this wheel, and never ship link-time stubs. These exclusions alone do not
 establish compatibility. `auditwheel show` still reports external NVIDIA
 libraries and can describe the wheel as `linux_x86_64`; retain that report.
+The plugin links `Threads::Threads` for tensoracle's mutexes. On glibc 2.28,
+retain the direct `libpthread.so.0` dependency and check its versioned pthread
+references; a successful shared-library link alone does not prove resolution.
 Check the plugin's versioned symbols separately and verify that the declared
 TensorRT wheel and host driver resolve its external dependencies at runtime.
 Keep the final `py3-none-manylinux_2_28_x86_64` tag only when these checks pass.
@@ -69,7 +80,7 @@ observer can verify fc1 launches and the selected SM without changing the plugin
 
 Retain installed dependency versions, GPU/driver/runtime versions, test commands,
 elapsed times, and disk measurements with the build records. Run the existing
-fc1 correctness and engine-cache recovery GPU tests with tensoracle 1.1.0. Record
+fc1 correctness and engine-cache recovery GPU tests with tensoracle 1.3.0. Record
 sm86 and sm89 as build/inspection coverage when those GPUs are unavailable.
 Check artifact size against the current upload limit before publication. These
 commands build and inspect artifacts; publication is a separate action.
