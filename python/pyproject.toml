@@ -21,7 +21,7 @@ dependencies = [
     "listenflow>=0.17.6",
     "numpy>=2.0",
     "safetensors>=0.4",
-    "tensoracle==1.4.0",
+    "tensoracle>=1.4.0,<2",
     "tensorrt-cu13>=11.0",
     "tokenizers>=0.22",
 ]
@@ -87,7 +87,7 @@ describe_command = [
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.8"]
 oracle = ["openai-whisper==20250625", "torch>=2.0"]
-cubin = ["tensoracle[producer]==1.4.0", "nvidia-cuda-runtime==13.2.86"]
+cubin = ["tensoracle[producer]>=1.4.0,<2", "nvidia-cuda-runtime==13.2.86"]
 evaluation = [
     "ctranslate2",
     "faster-whisper==1.2.1",

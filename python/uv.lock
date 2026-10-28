@@ -461,7 +461,7 @@ requires-dist = [
     { name = "listenflow", specifier = ">=0.17.6" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "safetensors", specifier = ">=0.4" },
-    { name = "tensoracle", specifier = "==1.4.0" },
+    { name = "tensoracle", specifier = ">=1.4.0,<2" },
     { name = "tensorrt-cu13", specifier = ">=11.0" },
     { name = "tokenizers", specifier = ">=0.22" },
 ]
@@ -469,7 +469,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 cubin = [
     { name = "nvidia-cuda-runtime", specifier = "==13.2.86" },
-    { name = "tensoracle", extras = ["producer"], specifier = "==1.4.0" },
+    { name = "tensoracle", extras = ["producer"], specifier = ">=1.4.0,<2" },
 ]
 dev = [
     { name = "pytest", specifier = ">=8.0" },

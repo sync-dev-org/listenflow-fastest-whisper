@@ -80,7 +80,7 @@ observer can verify fc1 launches and the selected SM without changing the plugin
 
 Retain installed dependency versions, GPU/driver/runtime versions, test commands,
 elapsed times, and disk measurements with the build records. Run the existing
-fc1 correctness and engine-cache recovery GPU tests with tensoracle 1.3.0. Record
+fc1 correctness and engine-cache recovery GPU tests with tensoracle 1.4.0. Record
 sm86 and sm89 as build/inspection coverage when those GPUs are unavailable.
 Check artifact size against the current upload limit before publication. These
 commands build and inspect artifacts; publication is a separate action.

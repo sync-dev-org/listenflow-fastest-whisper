@@ -139,7 +139,7 @@ Install the Python tooling from the repository root, keeping the environment in
 (cd python && uv sync --group dev --group cubin --locked)
 ```
 
-The lock supplies tensoracle 1.3.0, Triton 3.8.0, and the CUDA 13.2.86 NVIDIA
+The lock supplies tensoracle 1.4.0, Triton 3.8.0, and the CUDA 13.2.86 NVIDIA
 packages: runtime and CRT headers, nvcc/ptxas, NVVM, and cuobjdump. Cubin production
 uses tensoracle's pinned NVIDIA wheel tools and does not use a GPU. A fresh
 producer process must not import torch. The build finds tensoracle's C++ helper inside the installed
