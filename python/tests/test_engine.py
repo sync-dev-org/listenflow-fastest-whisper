@@ -17,11 +17,13 @@ from listenflow import (
     InferenceError,
     OfflineModelDirectorySource,
     Partial,
+    Segmentation,
     STTEngineBase,
     UtteranceBoundarySettings,
     UtteranceEnd,
     UtteranceStart,
 )
+from test_engine_decoding import runtime as runtime  # noqa: PLC0414 -- pytest fixture
 
 
 def _engine(tmp_path, **overrides):
@@ -43,10 +45,10 @@ async def _chunks(*chunks):
         yield chunk
 
 
-def _collect(native, engine, *chunks):
+def _collect(native, engine, *chunks, **stream_options):
     async def run():
         await engine.prepare()
-        return [event async for event in engine.stream(_chunks(*chunks))]
+        return [event async for event in engine.stream(_chunks(*chunks), **stream_options)]
 
     return native.run(run())
 
@@ -196,6 +198,118 @@ def test_capabilities_match_accepted_languages_and_are_static(tmp_path):
         "local_vad",
         "client_flush",
     }
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
+def test_single_utterance_capability_is_declared_before_preparation(tmp_path):
+    """Callers can select a single utterance before loading the model."""
+    assert _engine(tmp_path).capabilities.single_utterance is True
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
+def test_single_utterance_keeps_silence_that_segmentation_auto_splits(tmp_path, native):
+    """Single decoding retains all PCM while default and explicit auto split on silence."""
+    model = native(_Model())
+    engine = _engine(tmp_path)
+    leading = np.zeros(1600, dtype="<i2").tobytes()
+    first = np.full(1600, 1000, dtype="<i2").tobytes()
+    gap = np.zeros(16000, dtype="<i2").tobytes()
+    second = np.full(3200, 2000, dtype="<i2").tobytes()
+    trailing = np.zeros(1600, dtype="<i2").tobytes()
+    chunks = (leading, first, gap, second, trailing)
+    pcm = b"".join(chunks)
+
+    single = _collect(native, engine, *chunks, segmentation=Segmentation.SINGLE)
+
+    assert [type(event) for event in single] == [UtteranceStart, Partial, Final, UtteranceEnd]
+    assert single[0].utterance_id == single[-1].utterance_id
+    assert (single[0].ts_offset_s, single[-1].ts_offset_s) == (0, len(pcm) / 32000)
+    assert len(model.audio) == 1
+    np.testing.assert_array_equal(
+        model.audio[0], np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
+    )
+
+    for options in ({}, {"segmentation": Segmentation.AUTO}):
+        model.audio.clear()
+        automatic = _collect(native, engine, *chunks, **options)
+        starts = [event for event in automatic if isinstance(event, UtteranceStart)]
+        ends = [event for event in automatic if isinstance(event, UtteranceEnd)]
+        assert len(starts) == len(ends) == len(model.audio) == 2
+        assert [event.utterance_id for event in starts] == [event.utterance_id for event in ends]
+        assert [event.ts_offset_s for event in starts] == pytest.approx([0.1, 1.2])
+        for audio, utterance in zip(model.audio, (first + gap, second + trailing), strict=True):
+            np.testing.assert_array_equal(
+                audio, np.frombuffer(utterance, dtype="<i2").astype(np.float32) / 32768
+            )
+    native.run(engine.aclose())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
+@pytest.mark.parametrize("boundary_options", [{"min_voiced_s": 1.0}, {"voice_threshold": 0.9}])
+def test_single_utterance_bypasses_voice_and_duration_filters(tmp_path, native, boundary_options):
+    """A caller-selected short utterance is decoded even when automatic filters reject it."""
+    model = native(_Model())
+    engine = _engine(
+        tmp_path, boundary_settings=UtteranceBoundarySettings(preroll_s=0, **boundary_options)
+    )
+    pcm = np.full(160, 1000, dtype="<i2").tobytes()
+    _collect(native, engine, pcm)
+    assert not model.audio
+
+    events = _collect(native, engine, pcm, segmentation=Segmentation.SINGLE)
+
+    assert [type(event) for event in events] == [UtteranceStart, Partial, Final, UtteranceEnd]
+    assert len(model.audio) == 1
+    np.testing.assert_array_equal(model.audio[0], np.full(160, 1000 / 32768, dtype=np.float32))
+    assert (events[0].ts_offset_s, events[-1].ts_offset_s) == (0, 0.01)
+    native.run(engine.aclose())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
+def test_single_utterance_over_thirty_seconds_uses_timestamp_windows(
+    tmp_path, runtime, monkeypatch
+):
+    """One complete long PCM reaches transcription once and is decoded across timestamp windows."""
+    from listenflow.fastest_whisper._cached_model import CachedWhisper
+
+    prefixes = []
+    runtime(prefixes=prefixes)
+    engine = _engine(tmp_path, temperature=0.0)
+    samples = np.full(31 * 16000, 1000, dtype="<i2")
+    samples[:1600] = samples[-1600:] = 0
+    observed = []
+    transcribe = CachedWhisper.transcribe
+
+    def observe_transcription(model, audio, **options):
+        observed.append(audio.copy())
+        return transcribe(model, audio, **options)
+
+    monkeypatch.setattr(CachedWhisper, "transcribe", observe_transcription)
+
+    async def chunks():
+        for chunk in np.array_split(samples, 31):
+            yield chunk.tobytes()
+
+    async def collect():
+        async with engine:
+            events = [
+                event async for event in engine.stream(chunks(), segmentation=Segmentation.SINGLE)
+            ]
+            assert engine._model.encoded_windows == 2
+            return events
+
+    with asyncio.Runner() as runner:
+        events = runner.run(collect())
+
+    assert len(observed) == 1
+    np.testing.assert_array_equal(observed[0], samples.astype(np.float32) / 32768)
+    starts = [event for event in events if isinstance(event, UtteranceStart)]
+    ends = [event for event in events if isinstance(event, UtteranceEnd)]
+    assert len(starts) == len(ends) == 1
+    assert starts[0].utterance_id == ends[0].utterance_id
+    assert (starts[0].ts_offset_s, ends[0].ts_offset_s) == (0, 31)
+    assert [event.text for event in events if isinstance(event, Final)] == ["A C", "A C"]
+    assert prefixes and all(8 not in prefix for prefix in prefixes)
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-019")

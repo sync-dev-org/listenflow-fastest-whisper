@@ -410,11 +410,11 @@ wheels = [
 
 [[package]]
 name = "listenflow"
-version = "0.17.6"
+version = "0.20.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ac/9c/8cba2f1e711920fc11f7896204311d18996ee4f053cb444a137f3f1feb62/listenflow-0.17.6.tar.gz", hash = "sha256:d16559ff2a9c312838112074ff408af7a333bae2cff1c4666c2e8ac7085f347d", size = 19894, upload-time = "2026-10-12T20:17:03.109Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/19/ed/84c2c8e2d34cbb93fccc41be850dcaaa9afb425347b5458c6b9ecca60bf2/listenflow-0.20.0.tar.gz", hash = "sha256:816fb8713d235355501a7e0ca54313d3647743719b0c337b13b9d163a01a9f42", size = 22572, upload-time = "2026-10-29T15:49:44.738Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4b/f6/730f1432779dda0773532254e9525441039d09dbb0ebaf4d814f0ad93265/listenflow-0.17.6-py3-none-any.whl", hash = "sha256:a41e0be1a713f3b1340c946e1781419c1c8cc06902de920e7cfcb18eaaed37cd", size = 22739, upload-time = "2026-10-12T20:17:01.499Z" },
+    { url = "https://files.pythonhosted.org/packages/83/1f/b6d2a88507bf5e880fc6900aa81fbe4dc373110f6077d476e2cf25928318/listenflow-0.20.0-py3-none-any.whl", hash = "sha256:8445ce680e47f4dd4f7fa09c42b00ac46287026ad81e5d6a01c28da8430d00c4", size = 26046, upload-time = "2026-10-29T15:49:43.341Z" },
 ]
 
 [[package]]
@@ -458,7 +458,7 @@ oracle = [
 [package.metadata]
 requires-dist = [
     { name = "cuda-python", specifier = ">=13.0" },
-    { name = "listenflow", specifier = ">=0.17.6" },
+    { name = "listenflow", specifier = ">=0.20.0" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "safetensors", specifier = ">=0.4" },
     { name = "tensoracle", specifier = ">=1.4.0,<2" },

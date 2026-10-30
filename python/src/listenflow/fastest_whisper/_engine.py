@@ -28,6 +28,7 @@ from listenflow import (
     InferenceError,
     OfflineModelDirectorySource,
     PartialMode,
+    Segmentation,
     STTEngineBase,
     TimestampDetail,
     TranscriptEvent,
@@ -198,6 +199,7 @@ class FastestWhisperEngine(STTEngineBase):
             diarization=DiarizationMode.NONE,
             languages=frozenset({"en"}),
             auto_language=True,
+            single_utterance=True,
         )
 
     async def _load(self) -> None:
@@ -262,7 +264,12 @@ class FastestWhisperEngine(STTEngineBase):
             device=self.device,
         )
 
-    async def _recognize(self, pcm_chunks: AsyncIterator[bytes]) -> AsyncIterator[TranscriptEvent]:
+    async def _recognize(
+        self,
+        pcm_chunks: AsyncIterator[bytes],
+        *,
+        segmentation: Segmentation = Segmentation.AUTO,
+    ) -> AsyncIterator[TranscriptEvent]:
         self._session_counter += 1
         self._bias_application = BiasApplicationSnapshot(
             session_id=self._session_counter,
@@ -273,7 +280,7 @@ class FastestWhisperEngine(STTEngineBase):
             evidence_method="verified_apply_path",
             evidence_detail="CachedWhisper.transcribe(..., initial_prompt=...) supplies decoder context",
         )
-        pipeline_stream = self._pipeline.stream(pcm_chunks)
+        pipeline_stream = self._pipeline.stream(pcm_chunks, segmentation=segmentation)
         try:
             async for event in pipeline_stream:
                 yield event

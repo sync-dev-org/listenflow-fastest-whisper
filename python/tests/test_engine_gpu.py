@@ -22,6 +22,7 @@ from listenflow import (
     Final,
     OfflineModelDirectorySource,
     Partial,
+    Segmentation,
     UtteranceBoundarySettings,
     UtteranceEnd,
     UtteranceStart,
@@ -163,6 +164,57 @@ def test_fp32_engine_stream_matches_official_text(gpu, engine_loop):
     events = _events(engine_loop, _engine(gpu), pcm)
     assert [type(event) for event in events] == [UtteranceStart, Partial, Final, UtteranceEnd]
     assert events[2].text == expected
+
+
+@pytest.mark.gpu
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
+@pytest.mark.parametrize("kind,repetitions", [("long_silence", 2), ("over_thirty_seconds", 3)])
+def test_single_utterance_transcribes_complete_english_pcm_once(
+    gpu, engine_loop, monkeypatch, kind, repetitions
+):
+    """Single recognition decodes all English speech despite a long silence or duration over 30 s."""
+    from whisper.normalizers import EnglishTextNormalizer
+
+    from listenflow.fastest_whisper._cached_model import CachedWhisper
+
+    speech = _pcm("small_boat_16khz_mono_s16le.wav")
+    if kind == "long_silence":
+        pcm = speech + np.zeros(32000, dtype="<i2").tobytes() + speech
+    else:
+        pcm = speech * repetitions
+        assert len(pcm) / 32000 > 30
+    expected = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
+    calls = []
+    transcribe = CachedWhisper.transcribe
+
+    def observe_transcription(model, audio, **options):
+        np.testing.assert_array_equal(audio, expected)
+        calls.append(len(audio))
+        return transcribe(model, audio, **options)
+
+    monkeypatch.setattr(CachedWhisper, "transcribe", observe_transcription)
+    engine = _engine(gpu, precision="fp32", temperature=0.0, best_of=1)
+
+    async def collect():
+        async with engine:
+            return [
+                event
+                async for event in engine.stream(_chunks(pcm), segmentation=Segmentation.SINGLE)
+            ]
+
+    events = engine_loop.run(collect())
+
+    assert calls == [len(expected)]
+    starts = [event for event in events if isinstance(event, UtteranceStart)]
+    ends = [event for event in events if isinstance(event, UtteranceEnd)]
+    assert len(starts) == len(ends) == 1
+    assert starts[0].utterance_id == ends[0].utterance_id
+    assert (starts[0].ts_offset_s, ends[0].ts_offset_s) == (0, len(pcm) / 32000)
+    text = EnglishTextNormalizer()(
+        " ".join(event.text for event in events if isinstance(event, Final))
+    )
+    for phrase in ("every morning", "by noon", "fresh fish for the market"):
+        assert text.count(phrase) == repetitions, text
 
 
 @pytest.mark.gpu

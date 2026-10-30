@@ -18,7 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "cuda-python>=13.0",
-    "listenflow>=0.17.6",
+    "listenflow>=0.20.0",
     "numpy>=2.0",
     "safetensors>=0.4",
     "tensoracle>=1.4.0,<2",

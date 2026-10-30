@@ -48,7 +48,7 @@ def runtime(monkeypatch):
 
     monkeypatch.setattr(engine_module, "_cuda_device_info", lambda _device: (1, (12, 0)))
 
-    def install(*, repeated=False, no_speech=0.1, starts=(1,), by_temperature=False):
+    def install(*, repeated=False, no_speech=0.1, starts=(1,), by_temperature=False, prefixes=None):
         word = "A" * 100 if repeated else "A"
         vocab = {
             word: 0,
@@ -78,6 +78,7 @@ def runtime(monkeypatch):
                 self.eot = 3
                 self.suppressed = set(range(4, 11))
                 self.begin_suppressed = set()
+                self.encoded_windows = 0
 
             def warmup(self):
                 pass
@@ -92,9 +93,12 @@ def runtime(monkeypatch):
                 return np.zeros((1, audio.size // 160 + 3000), dtype=np.float32)
 
             def encode(self, _mel):
+                self.encoded_windows += 1
                 return np.empty(0, dtype=np.float32)
 
             def logits(self, prefix, _encoder):
+                if prefixes is not None:
+                    prefixes.append(prefix.copy())
                 task = len(prefix) - 1 - prefix[::-1].index(7)
                 long = len(prefix) <= task + 1 or prefix[task + 1] != 8
                 generated = prefix[task + (1 if long else 2) :]
