@@ -1,7 +1,10 @@
-"""Compare single-utterance fp16 latency with faster-whisper on LibriSpeech.
+"""Compare single-utterance fp16 latency with faster-whisper on LibriSpeech or FLEURS.
 
 Run convert, fp16, faster-whisper, and report in order. Invoke as a module so the
 shared WER evaluator is available from a standalone checkout.
+Use --wer-output-dir for the complete LibriSpeech selection, or --data-dir and
+--language for the first --limit FLEURS test recordings of at most 30 seconds
+(default: 100). Longer recordings are skipped and recorded in the report.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+from scripts.evaluate_fleurs import CONFIGS, error_unit, read_fleurs, score_text
 from scripts.evaluate_wer import (
     EXPECTED_INCLUDED,
     GREEDY_SETTINGS,
@@ -115,7 +119,68 @@ def clean_manifest(wer_output_dir: Path) -> list[dict[str, str]]:
     return rows
 
 
-def _load_waveform(row: dict[str, str]) -> np.ndarray:
+def fleurs_manifest(data_dir: Path, language: str, *, limit: int = 100) -> list[dict]:
+    """Keep the first eligible recordings in reader order, with exact float32 audio."""
+    rows, _ = _fleurs_selection(data_dir, language, limit=limit)
+    return rows
+
+
+def _fleurs_selection(
+    data_dir: Path, language: str, *, limit: int
+) -> tuple[list[dict], list[dict]]:
+    """Select short recordings and retain the original positions of excluded audio."""
+    if limit <= 0:
+        raise ValueError("FLEURS utterance limit must be positive")
+    rows, skipped = [], []
+    for position, row in enumerate(read_fleurs(data_dir, language), 1):
+        frames = len(row["audio"])
+        if frames <= 0:
+            raise ValueError("single-utterance latency requires nonempty audio")
+        if frames > MAX_FRAMES:
+            skipped.append(
+                {
+                    "id": row["id"],
+                    "reader_index_1_based": position,
+                    "frames": frames,
+                    "duration_seconds": frames / SAMPLE_RATE,
+                }
+            )
+            continue
+        rows.append({**row, "subset": "test", "frames": frames})
+        if len(rows) == limit:
+            break
+    if not rows:
+        raise ValueError("FLEURS selection contains no utterances")
+    return rows, skipped
+
+
+def _fleurs_provenance(
+    data_dir: Path,
+    language: str,
+    limit: int,
+    rows: list[dict],
+    *,
+    skipped_recordings: list[dict] | None = None,
+) -> dict:
+    manifest = [{key: row[key] for key in ("id", "frames", "reference")} for row in rows]
+    result = {
+        "data_dir": str(data_dir.resolve()),
+        "dataset_revision": data_dir.name,
+        "language": language,
+        "split": "test",
+        "limit": limit,
+        "manifest_sha256": hashlib.sha256(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+    }
+    if skipped_recordings:
+        result["skipped_recordings"] = skipped_recordings
+    return result
+
+
+def _load_waveform(row: dict) -> np.ndarray:
+    if isinstance(row["audio"], np.ndarray):
+        return validate_mono_waveform(row["audio"], sample_rate=SAMPLE_RATE)
     import soundfile as sf
 
     samples, sample_rate = sf.read(row["audio"], dtype="int16")
@@ -220,9 +285,15 @@ def convert(checkpoint_dir: Path, model_dir: Path) -> None:
 
 
 def _transcribe_tensor_rt(
-    model, samples: np.ndarray, settings: DecodingSettings | None = None
+    model,
+    samples: np.ndarray,
+    settings: DecodingSettings | None = None,
+    *,
+    language: str | None = None,
 ) -> str:
     settings = settings or GREEDY_SETTINGS
+    if language is not None:
+        model._set_language(language)
     mel = model._mel_spectrogram(samples)
     encoder = model.encode(mel)
     if settings.greedy_only:
@@ -237,14 +308,14 @@ def _transcribe_faster_whisper(model, samples: np.ndarray, options: dict) -> str
     return " ".join(segment.text.strip() for segment in segments if segment.text.strip())
 
 
-def _faster_whisper_options(checkpoint_dir: Path) -> dict:
+def _faster_whisper_options(checkpoint_dir: Path, *, language: str = "en") -> dict:
     from tokenizers import Tokenizer
 
     from listenflow.fastest_whisper._inference import _suppressed_tokens
 
     tokenizer = Tokenizer.from_file(str(checkpoint_dir / "tokenizer.json"))
     return {
-        "language": "en",
+        "language": language,
         "task": "transcribe",
         "beam_size": 1,
         "best_of": 1,
@@ -269,11 +340,14 @@ def _faster_whisper_options(checkpoint_dir: Path) -> dict:
 def run(
     route: str,
     checkpoint_dir: Path,
-    wer_output_dir: Path,
+    wer_output_dir: Path | None,
     output_dir: Path,
     model_dir: Path | None,
     *,
     settings: DecodingSettings | None = None,
+    data_dir: Path | None = None,
+    language: str = "en",
+    limit: int = 100,
 ) -> None:
     """Measure one warmed, loaded model on every selected utterance, batch one."""
     import ctranslate2
@@ -282,7 +356,14 @@ def run(
 
     settings = settings or GREEDY_SETTINGS
     name = mode_name(settings) if route == "fp16" else route
-    rows = clean_manifest(wer_output_dir)
+    skipped_recordings = []
+    if data_dir is None:
+        if wer_output_dir is None or language != "en":
+            raise ValueError("LibriSpeech requires --wer-output-dir and language en")
+        rows = clean_manifest(wer_output_dir)
+    else:
+        error_unit(language)
+        rows, skipped_recordings = _fleurs_selection(data_dir, language, limit=limit)
     output_dir.mkdir(parents=True, exist_ok=True)
     final_csv = output_dir / f"{name}.csv"
     partial_csv = output_dir / f"{name}.csv.partial"
@@ -310,7 +391,7 @@ def run(
         effective_compute_type = "fp16 TensorRT network"
     else:
         assert model_dir is not None
-        options = _faster_whisper_options(checkpoint_dir)
+        options = _faster_whisper_options(checkpoint_dir, language=language)
         model = faster_whisper.WhisperModel(
             str(model_dir),
             device="cuda",
@@ -345,7 +426,7 @@ def run(
     _synchronize()
     warmup_started = time.monotonic()
     if route == "fp16":
-        _transcribe_tensor_rt(model, first_waveform, settings)
+        _transcribe_tensor_rt(model, first_waveform, settings, language=language)
     else:
         assert options is not None
         _transcribe_faster_whisper(model, first_waveform, options)
@@ -362,7 +443,9 @@ def run(
             samples = first_waveform if index == 1 else _load_waveform(row)
             if route == "fp16":
                 text, seconds, cpu_seconds = _measure(
-                    lambda samples=samples: _transcribe_tensor_rt(model, samples, settings)
+                    lambda samples=samples: _transcribe_tensor_rt(
+                        model, samples, settings, language=language
+                    )
                 )
             else:
                 assert options is not None
@@ -371,7 +454,7 @@ def run(
                 )
             writer.writerow(
                 {
-                    "subset": "test-clean",
+                    "subset": row["subset"],
                     "id": row["id"],
                     "frames": row["frames"],
                     "seconds": seconds,
@@ -418,7 +501,7 @@ def run(
         "effective_compute_type": effective_compute_type,
         "decode_options": options
         or {
-            "language": "en",
+            "language": language,
             "task": "transcribe",
             "beam_size": settings.beam_size,
             "temperature": list(settings.temperatures),
@@ -438,6 +521,13 @@ def run(
         "faster_whisper": faster_whisper.__version__,
         "gpu_observations": observations,
     }
+    if data_dir is not None:
+        metadata["fleurs"] = _fleurs_provenance(
+            data_dir, language, limit, rows, skipped_recordings=skipped_recordings
+        )
+        metadata["execution_order"] = (
+            "first recordings at most 30 seconds in read_fleurs order (Parquet row order)"
+        )
     final_json.write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
@@ -446,14 +536,15 @@ def run(
 
 def _latencies(rows: list[dict[str, str]], manifest: list[dict[str, str]]) -> list[Latency]:
     expected = {row["id"]: int(row["frames"]) for row in manifest}
+    subsets = {row["id"]: row["subset"] for row in manifest}
     if len(expected) != len(manifest):
         raise ValueError("duplicate utterance IDs in manifest")
     result = []
     for row in rows:
         utterance_id = row["id"]
         if (
-            row["subset"] != "test-clean"
-            or utterance_id not in expected
+            utterance_id not in expected
+            or row["subset"] != subsets[utterance_id]
             or int(row["frames"]) != expected[utterance_id]
         ):
             raise ValueError(f"result does not match manifest: {utterance_id}")
@@ -461,8 +552,82 @@ def _latencies(rows: list[dict[str, str]], manifest: list[dict[str, str]]) -> li
     return result
 
 
-def report(wer_output_dir: Path, output_dir: Path) -> None:
+def _report_fleurs(data_dir: Path, output_dir: Path, language: str, limit: int) -> None:
+    """Pair identical FLEURS recordings and score both outputs on the required units."""
+    manifest, skipped_recordings = _fleurs_selection(data_dir, language, limit=limit)
+    expected_ids = {row["id"] for row in manifest}
+    provenance = _fleurs_provenance(
+        data_dir, language, limit, manifest, skipped_recordings=skipped_recordings
+    )
+    latency, scores, metadata = {}, {}, {}
+    for route in ("fp16", "faster-whisper"):
+        metadata[route] = json.loads((output_dir / f"{route}.json").read_text(encoding="utf-8"))
+        if metadata[route]["decode_options"]["language"] != language:
+            raise ValueError("routes used a different language")
+        if metadata[route].get("fleurs") != provenance:
+            raise ValueError("routes used a different FLEURS selection")
+        rows = read_csv(output_dir / f"{route}.csv")
+        observations = _latencies(rows, manifest)
+        # Apply the same completeness and finite-duration checks as LibriSpeech.
+        summarize_latencies(observations, expected_ids)
+        seconds = [row.seconds for row in observations]
+        latency[route] = {
+            "median_seconds": statistics.median(seconds),
+            "p90_seconds": float(np.percentile(seconds, 90)),
+        }
+        keyed = {row["id"]: row for row in rows}
+        measured = [
+            score_text(row["reference"], keyed[row["id"]]["output"], language) for row in manifest
+        ]
+        errors = sum(row["errors"] for row in measured)
+        units = sum(row["reference_units"] for row in measured)
+        if units == 0:
+            raise ValueError("FLEURS selection has no normalized reference units")
+        scores[route] = {
+            "errors": errors,
+            "reference_units": units,
+            "rate_percent": 100 * errors / units,
+        }
+    if metadata["fp16"]["checkpoint_sha256"] != metadata["faster-whisper"]["checkpoint_sha256"]:
+        raise ValueError("routes used different checkpoints")
+    result = {
+        "dataset": "fleurs",
+        "language": language,
+        "utterances": len(manifest),
+        "execution_order": (
+            "first recordings at most 30 seconds in read_fleurs order (Parquet row order)"
+        ),
+        "utterance_ids": [row["id"] for row in manifest],
+        "skipped_recordings": skipped_recordings,
+        "error_unit": error_unit(language),
+        "latency": latency,
+        "ratio_fp16_over_faster_whisper": {
+            name: latency["fp16"][f"{name}_seconds"] / latency["faster-whisper"][f"{name}_seconds"]
+            for name in ("median", "p90")
+        },
+        "error_rates": scores,
+        "runs": metadata,
+    }
+    target = output_dir / "report.json"
+    with target.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+    print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
+
+
+def report(
+    wer_output_dir: Path | None,
+    output_dir: Path,
+    *,
+    data_dir: Path | None = None,
+    language: str = "en",
+    limit: int = 100,
+) -> None:
     """Validate both complete runs and write duration bands and text diagnostics."""
+    if data_dir is not None:
+        _report_fleurs(data_dir, output_dir, language, limit)
+        return
+    if wer_output_dir is None or language != "en":
+        raise ValueError("LibriSpeech requires --wer-output-dir and language en")
     from whisper.normalizers import EnglishTextNormalizer
 
     manifest = clean_manifest(wer_output_dir)
@@ -541,23 +706,36 @@ def main() -> None:
     parser.add_argument("phase", choices=("convert", "fp16", "faster-whisper", "report"))
     parser.add_argument("--checkpoint-dir", type=Path)
     parser.add_argument("--model-dir", type=Path)
-    parser.add_argument("--wer-output-dir", type=Path)
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument("--wer-output-dir", type=Path)
+    sources.add_argument("--data-dir", type=Path, help="FLEURS root containing language shards")
+    parser.add_argument("--language", choices=CONFIGS, default="en")
+    parser.add_argument("--limit", type=int, default=100, help="first FLEURS recordings to measure")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--beam-size", type=int, default=1)
     parser.add_argument("--temperature", default="0")
     parser.add_argument("--best-of", type=int, default=1)
     args = parser.parse_args()
+    input_options = {}
+    if args.data_dir is not None:
+        if args.limit <= 0:
+            parser.error("FLEURS --limit must be positive")
+        input_options = {"data_dir": args.data_dir, "language": args.language, "limit": args.limit}
+    elif args.language != "en":
+        parser.error("LibriSpeech requires --language en; use --data-dir for FLEURS")
     if args.phase == "convert":
         if args.checkpoint_dir is None:
             parser.error("convert requires --checkpoint-dir")
         convert(args.checkpoint_dir, args.output_dir)
     elif args.phase == "report":
-        if args.wer_output_dir is None:
-            parser.error("report requires --wer-output-dir")
-        report(args.wer_output_dir, args.output_dir)
+        if args.wer_output_dir is None and args.data_dir is None:
+            parser.error("report requires --wer-output-dir or --data-dir")
+        report(args.wer_output_dir, args.output_dir, **input_options)
     else:
-        if args.checkpoint_dir is None or args.wer_output_dir is None:
-            parser.error(f"{args.phase} requires --checkpoint-dir and --wer-output-dir")
+        if args.checkpoint_dir is None or (args.wer_output_dir is None and args.data_dir is None):
+            parser.error(
+                f"{args.phase} requires --checkpoint-dir and --wer-output-dir or --data-dir"
+            )
         if args.phase == "fp16":
             try:
                 temperatures = tuple(float(value) for value in args.temperature.split(","))
@@ -573,6 +751,7 @@ def main() -> None:
                 args.output_dir,
                 args.model_dir,
                 settings=settings,
+                **input_options,
             )
         else:
             run(
@@ -581,6 +760,7 @@ def main() -> None:
                 args.wer_output_dir,
                 args.output_dir,
                 args.model_dir,
+                **input_options,
             )
 
 

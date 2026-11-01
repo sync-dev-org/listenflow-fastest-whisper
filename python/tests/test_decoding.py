@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from tokenizers import Tokenizer, models
 
 from listenflow.fastest_whisper import (
     _decoding,
@@ -563,6 +564,8 @@ def test_long_entry_applies_settings_with_hint_to_its_decoded_window(monkeypatch
 def test_cached_runtime_accepts_beam_settings_for_short_audio():
     """The reusable runtime can decode one utterance with a selected beam width."""
     model = CachedWhisper.__new__(CachedWhisper)
+    model.tokenizer = Tokenizer(models.WordLevel({"<|en|>": 2}))
+    model.initial_tokens = [1, 2, 3, 4]
     model._mel = _NativeMel()
     model.config = SimpleNamespace(n_mels=128)
     model.prompt_tokens = lambda hint: [42] if hint else []
@@ -589,6 +592,8 @@ def test_cached_runtime_accepts_beam_settings_for_short_audio():
 def test_cached_runtime_omits_best_of_as_five_samples():
     """The reusable runtime selects five candidates when the caller omits best_of."""
     model = CachedWhisper.__new__(CachedWhisper)
+    model.tokenizer = Tokenizer(models.WordLevel({"<|en|>": 2}))
+    model.initial_tokens = [1, 2, 3, 4]
     model._mel = _NativeMel()
     model.config = SimpleNamespace(n_mels=128)
     model.prompt_tokens = lambda _hint: []

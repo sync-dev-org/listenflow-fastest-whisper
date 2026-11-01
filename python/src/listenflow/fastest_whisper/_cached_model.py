@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
 
 import numpy as np
@@ -13,8 +12,6 @@ from ._decoding import DecodingSettings, decoding_settings
 from ._engines import _open_mel_engine, open_whisper_engine
 from ._inference import TensorRTWhisper
 from ._longform import TimedSegment, transcribe_mel
-
-_LANGUAGE_TOKEN = re.compile(r"<\|([a-z]{2,3})\|>")
 
 
 class CachedWhisper(TensorRTWhisper):
@@ -37,23 +34,11 @@ class CachedWhisper(TensorRTWhisper):
             logger=self.logger,
         )
 
-    def detect_language(self, audio: np.ndarray) -> str:
-        mel = self._mel_spectrogram(audio[:N_SAMPLES])
-        encoder = self.encode(mel)
-        logits = self.logits([self.initial_tokens[0]], encoder)[-1]
-        candidates = {
-            token_id: match.group(1)
-            for token, token_id in self.tokenizer.get_vocab().items()
-            if (match := _LANGUAGE_TOKEN.fullmatch(token)) is not None
-        }
-        if not candidates:
-            raise ValueError("checkpoint tokenizer has no language tokens")
-        return candidates[max(candidates, key=lambda token_id: float(logits[token_id]))]
-
     def transcribe(
         self,
         audio: np.ndarray,
         *,
+        language: str | None = "en",
         initial_prompt: str | None = None,
         beam_size: int = DecodingSettings.beam_size,
         temperature: float | Sequence[float] = DecodingSettings.temperatures,
@@ -73,17 +58,25 @@ class CachedWhisper(TensorRTWhisper):
         prompt_tokens = self.prompt_tokens(initial_prompt)
         if audio.size <= N_SAMPLES:
             mel = self._mel_spectrogram(audio)
-            result = self.decode_short(self.encode(mel), prompt_tokens, settings)
+            encoder = self.encode(mel)
+            self._set_language(language if language is not None else self._detect_language(encoder))
+            result = self.decode_short(encoder, prompt_tokens, settings)
             return [TimedSegment(0.0, audio.size / 16_000, result.text)] if result.text else []
 
         mel = self._mel_spectrogram_long(audio)
         timestamp_begin = self.tokenizer.token_to_id("<|0.00|>")
         if timestamp_begin is None:
             raise ValueError("checkpoint tokenizer lacks timestamp tokens")
+
+        def decode(window, prompt):
+            encoder = self.encode(window)
+            self._set_language(language if language is not None else self._detect_language(encoder))
+            return self.decode_long(encoder, prompt, settings)
+
         result = transcribe_mel(
             mel,
             content_frames=mel.shape[-1] - 3_000,
-            decode=lambda window, prompt: self.decode_long(self.encode(window), prompt, settings),
+            decode=decode,
             text=lambda tokens: self.tokenizer.decode(tokens, skip_special_tokens=False),
             timestamp_begin=timestamp_begin,
             eot=self.eot,

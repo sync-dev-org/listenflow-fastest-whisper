@@ -90,6 +90,21 @@ def decoding_settings(
     )
 
 
+def should_skip_window(
+    no_speech_prob: float,
+    avg_logprob: float,
+    *,
+    no_speech_threshold: float | None,
+    logprob_threshold: float | None,
+) -> bool:
+    """Apply the official silence rule to the final attempt for a window."""
+    return (
+        no_speech_threshold is not None
+        and no_speech_prob > no_speech_threshold
+        and not (logprob_threshold is not None and avg_logprob > logprob_threshold)
+    )
+
+
 def _logprobs(logits: np.ndarray) -> np.ndarray:
     values = np.asarray(logits, dtype=np.float32)
     largest = np.max(values)

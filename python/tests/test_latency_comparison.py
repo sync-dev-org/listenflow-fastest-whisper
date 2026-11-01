@@ -1,5 +1,6 @@
 """CPU-only behavior checks for the single-utterance speed comparison."""
 
+import io
 import json
 import os
 import sys
@@ -20,6 +21,40 @@ from whisper.normalizers import EnglishTextNormalizer
 
 from listenflow.fastest_whisper._decoding import DecodingSettings
 from listenflow.fastest_whisper._inference import Transcription
+
+
+def _fleurs_shard(root, language, references, *, frames=None):
+    """Write synthetic recordings in deliberately unsorted Parquet row order."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import soundfile as sf
+    from scripts.evaluate_fleurs import CONFIGS
+
+    records = []
+    for index, reference in enumerate(references):
+        frame_count = 160 if frames is None else frames[index]
+        audio = io.BytesIO()
+        sf.write(
+            audio,
+            np.full(frame_count, index / 1000, dtype=np.float32),
+            16000,
+            format="WAV",
+            subtype="FLOAT",
+        )
+        filename = f"{len(references) - index:03}.wav"
+        records.append(
+            {
+                "id": 17,
+                "path": filename,
+                "transcription": reference,
+                "num_samples": frame_count,
+                "audio": {"path": filename, "bytes": audio.getvalue()},
+            }
+        )
+    target = root / CONFIGS[language] / "test-00000-of-00001.parquet"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pylist(records), target)
+    return [f"{CONFIGS[language]}/{row['path']}" for row in records]
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
@@ -309,3 +344,256 @@ def test_report_requires_the_prior_fp16_reference_and_records_text_diagnostics(t
     assert result["prior_fp16_differences"][0]["prior_errors"] == 2
     assert result["prior_fp16_differences"][0]["new_errors"] == 0
     assert result["faster_whisper_wer"] == pytest.approx(1 / (2611 * 2))
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-005")
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.parametrize("language", ["en", "zh", "yue", "ja", "ko", "ru", "ar", "hi", "th"])
+def test_selected_language_reaches_both_greedy_decoders(tmp_path, language):
+    """Both engines receive the explicit language while retaining greedy settings."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    from listenflow.fastest_whisper._cached_model import CachedWhisper
+
+    languages = ("en", "zh", "yue", "ja", "ko", "ru", "ar", "hi", "th")
+    tokens = [
+        "[UNK]",
+        "<|endoftext|>",
+        "<|startoftranscript|>",
+        "<|transcribe|>",
+        "<|notimestamps|>",
+        *[f"<|{code}|>" for code in languages],
+        *[f"recognized-{code}" for code in languages],
+    ]
+    vocab = {token: index for index, token in enumerate(tokens)}
+    tokenizer = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    language_ids = {vocab[f"<|{code}|>"]: code for code in languages}
+
+    # Replace only the native GPU execution sessions. Language selection, prefix
+    # construction, decoding and tokenizer behavior remain the real objects.
+    class NativeSession:
+        outputs = ()
+
+        def __init__(self, route):
+            self.route = route
+            self.language = "en"
+
+        def run(self, inputs, **_kwargs):
+            if self.route == "mel":
+                return {"mel": np.zeros((2, 4), dtype=np.float32)}
+            if self.route == "encoder":
+                return {
+                    name: np.zeros((1,), dtype=np.float32)
+                    for name in ("encoder", "cross_keys", "cross_values")
+                }
+            token = int(inputs["tokens"].item())
+            self.language = language_ids.get(token, self.language)
+            position = int(inputs["positions"].item())
+            next_token = vocab[f"recognized-{self.language}"] if position < 4 else 1
+            logits = np.full((1, 1, len(vocab)), -20, dtype=np.float32)
+            logits[0, 0, next_token] = 20
+            return {
+                "logits": logits,
+                "present_keys": np.zeros((1,), dtype=np.float32),
+                "present_values": np.zeros((1,), dtype=np.float32),
+            }
+
+        def close(self):
+            pass
+
+    model = CachedWhisper.__new__(CachedWhisper)
+    model.config = SimpleNamespace(
+        text_positions=16, text_layers=1, text_heads=1, audio_state=2, vocab_size=len(vocab)
+    )
+    model.tokenizer = tokenizer
+    model.initial_tokens = [2, vocab["<|en|>"], 3, 4]
+    model.eot = 1
+    model.precision = "fp16"
+    model.suppressed = set()
+    model.begin_suppressed = set()
+    model._prefix_states = {}
+    model._root_prefix = ()
+    model._mel = NativeSession("mel")
+    model._encoder = NativeSession("encoder")
+    model._decoder = NativeSession("decoder")
+    try:
+        assert (
+            _transcribe_tensor_rt(model, np.zeros(160, dtype=np.float32), language=language)
+            == f"recognized-{language}"
+        )
+    finally:
+        model.close()
+
+    options = benchmark_latency._faster_whisper_options(tmp_path, language=language)
+    assert options["language"] == language
+    assert options["beam_size"] == options["best_of"] == 1
+    assert options["temperature"] == 0
+    assert options["without_timestamps"] is True
+    assert options["condition_on_previous_text"] is False
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-005")
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+def test_fleurs_latency_selects_first_hundred_recordings_in_reader_order(tmp_path):
+    """The benchmark keeps the first 100 reader results and the exact float32 samples."""
+    ids = _fleurs_shard(tmp_path, "ja", ["synthetic reference"] * 101)
+    rows = benchmark_latency.fleurs_manifest(tmp_path, "ja")
+    assert [row["id"] for row in rows] == ids[:100]
+    assert rows[0]["subset"] == "test"
+    assert rows[0]["frames"] == 160
+    assert rows[0]["reference"] == "synthetic reference"
+    np.testing.assert_array_equal(rows[99]["audio"], np.full(160, 0.099, dtype=np.float32))
+    for limit in (0, -1):
+        with pytest.raises(ValueError, match="positive"):
+            benchmark_latency.fleurs_manifest(tmp_path, "ja", limit=limit)
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-005")
+def test_fleurs_latency_skips_long_recordings_and_reports_original_positions(tmp_path):
+    """Both engines keep the first N eligible recordings and report excluded original rows."""
+    data = tmp_path / "data"
+    output = tmp_path / "output"
+    output.mkdir()
+    frames = (480001, 160, 480160, 480000, 160)
+    ids = _fleurs_shard(data, "ja", ["甲乙"] * len(frames), frames=frames)
+
+    manifest = benchmark_latency.fleurs_manifest(data, "ja", limit=2)
+
+    assert [row["id"] for row in manifest] == [ids[1], ids[3]]
+    assert [row["frames"] for row in manifest] == [160, 480000]
+    skipped = [
+        {
+            "id": ids[index],
+            "reader_index_1_based": index + 1,
+            "frames": frames[index],
+            "duration_seconds": frames[index] / 16000,
+        }
+        for index in (0, 2)
+    ]
+    provenance = benchmark_latency._fleurs_provenance(
+        data, "ja", 2, manifest, skipped_recordings=skipped
+    )
+    for route in ("fp16", "faster-whisper"):
+        rows = [
+            {
+                "subset": "test",
+                "id": row["id"],
+                "frames": row["frames"],
+                "seconds": 0.1,
+                "output": "甲乙",
+            }
+            for row in manifest
+        ]
+        write_csv(output / f"{route}.csv", rows, list(rows[0]))
+        (output / f"{route}.json").write_text(
+            json.dumps(
+                {
+                    "checkpoint_sha256": {"model.safetensors": "same"},
+                    "fleurs": provenance,
+                    "decode_options": {"language": "ja"},
+                }
+            )
+        )
+
+    report(None, output, data_dir=data, language="ja", limit=2)
+
+    result = json.loads((output / "report.json").read_text())
+    assert result["utterances"] == 2
+    assert result["utterance_ids"] == [ids[1], ids[3]]
+    assert result["skipped_recordings"] == skipped
+    for route in ("fp16", "faster-whisper"):
+        assert result["runs"][route]["fleurs"]["skipped_recordings"] == skipped
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-005")
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.parametrize(
+    "language,reference,first,second,unit",
+    [
+        ("ja", "甲 乙 丙 丁！", "甲乙丙丁", "甲乙丙", "CER"),
+        ("ru", "ONE two THREE four!", "one two three four", "one two three", "WER"),
+    ],
+)
+def test_fleurs_cli_reports_paired_latency_and_both_normalized_error_rates(
+    tmp_path, monkeypatch, language, reference, first, second, unit
+):
+    """FLEURS reports median, p90, ratios and CER/WER without a prior English WER run."""
+    data = tmp_path / "data"
+    output = tmp_path / "output"
+    output.mkdir()
+    ids = _fleurs_shard(data, language, [reference] * 3)[:2]
+    manifest = benchmark_latency.fleurs_manifest(data, language, limit=2)
+    provenance = benchmark_latency._fleurs_provenance(data, language, 2, manifest)
+    for route, seconds, text in (
+        ("fp16", (0.1, 0.5), first),
+        ("faster-whisper", (0.2, 0.4), second),
+    ):
+        rows = [
+            {"subset": "test", "id": key, "frames": 160, "seconds": duration, "output": text}
+            for key, duration in zip(ids, seconds, strict=True)
+        ]
+        write_csv(output / f"{route}.csv", rows, list(rows[0]))
+        (output / f"{route}.json").write_text(
+            json.dumps(
+                {
+                    "checkpoint_sha256": {"model.safetensors": "same"},
+                    "fleurs": provenance,
+                    "decode_options": {"language": language},
+                }
+            )
+        )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_latency",
+            "report",
+            "--data-dir",
+            str(data),
+            "--output-dir",
+            str(output),
+            "--language",
+            language,
+            "--limit",
+            "2",
+        ],
+    )
+    benchmark_latency.main()
+    result = json.loads((output / "report.json").read_text())
+    assert result["language"] == language
+    assert result["utterances"] == 2
+    assert result["utterance_ids"] == ids
+    assert result["error_unit"] == unit
+    assert result["latency"]["fp16"]["median_seconds"] == pytest.approx(0.3)
+    assert result["latency"]["fp16"]["p90_seconds"] == pytest.approx(0.46)
+    assert result["latency"]["faster-whisper"]["p90_seconds"] == pytest.approx(0.38)
+    assert result["ratio_fp16_over_faster_whisper"]["median"] == pytest.approx(1)
+    assert result["ratio_fp16_over_faster_whisper"]["p90"] == pytest.approx(0.46 / 0.38)
+    assert result["error_rates"]["fp16"] == {
+        "errors": 0,
+        "reference_units": 8,
+        "rate_percent": 0,
+    }
+    assert result["error_rates"]["faster-whisper"] == {
+        "errors": 2,
+        "reference_units": 8,
+        "rate_percent": 25,
+    }
+
+    (output / "report.json").unlink()
+    path = output / "faster-whisper.json"
+    metadata = json.loads(path.read_text())
+    metadata["decode_options"]["language"] = "en"
+    path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="language"):
+        benchmark_latency.main()
+
+    metadata["decode_options"]["language"] = language
+    path.write_text(json.dumps(metadata))
+    rows.pop()
+    (output / "faster-whisper.csv").unlink()
+    write_csv(output / "faster-whisper.csv", rows, list(rows[0]))
+    with pytest.raises(ValueError, match="utterance IDs"):
+        benchmark_latency.main()

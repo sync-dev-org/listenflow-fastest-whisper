@@ -74,6 +74,8 @@ class _Model:
 
     def transcribe(self, audio, **kwargs):
         self.audio.append(audio.copy())
+        if kwargs.get("language", "en") is None:
+            self.detect_language(audio)
         return self.segments
 
     def detect_language(self, audio):
@@ -181,15 +183,21 @@ def test_health_reports_hint_only_after_a_successful_decode(tmp_path, native, pr
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-019")
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
 def test_capabilities_match_accepted_languages_and_are_static(tmp_path):
     """The engine accepts exactly its declared language codes plus automatic detection."""
+    from whisper.tokenizer import LANGUAGES
+
     english = _engine(tmp_path)
     automatic = _engine(tmp_path, language=None, input_format=EngineInputFormat.PCM_F32)
-    assert english.capabilities.languages == automatic.capabilities.languages == frozenset({"en"})
+    assert len(LANGUAGES) == 100
+    assert (
+        english.capabilities.languages == automatic.capabilities.languages == frozenset(LANGUAGES)
+    )
     assert english.capabilities.auto_language is automatic.capabilities.auto_language is True
     for language in english.capabilities.languages:
         assert _engine(tmp_path, language=language).language == language
-    for language in ("ja", "English", "en-US", "EN", "en_us", "eng", "", 7, b"en"):
+    for language in ("zz", "English", "en-US", "EN", "en_us", "eng", "", 7, b"en", []):
         with pytest.raises(ConfigurationError, match="language"):
             _engine(tmp_path, language=language)
     assert automatic.capabilities.input_format is EngineInputFormat.PCM_F32
@@ -369,28 +377,41 @@ def test_silent_decode_closes_utterance_without_text_events(tmp_path, native, te
     assert (events[0].ts_offset_s, events[1].ts_offset_s) == (0, 0.01)
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-019")
-def test_automatic_language_rejects_non_english_and_recovers(tmp_path, native):
-    """An unsupported detected language is a configuration error and permits reuse."""
-    from listenflow.fastest_whisper import UnsupportedLanguageError
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.parametrize("language", ["en", "ja", "yue", None])
+def test_stream_passes_language_selection_to_the_window_decoder(tmp_path, native, language):
+    """The stream preserves explicit and automatic language selection for every utterance."""
+    observed = []
 
-    model = native(_Model(language="ja"))
-    engine = _engine(tmp_path, language=None)
+    class Model(_Model):
+        def transcribe(self, audio, **kwargs):
+            observed.append(kwargs["language"])
+            return super().transcribe(audio, **kwargs)
+
+    model = native(Model())
+    engine = _engine(tmp_path, language=language)
     speech = np.full(160, 1000, dtype="<i2").tobytes()
-    with pytest.raises(ConfigurationError, match="ja") as failure:
-        _collect(native, engine, speech)
-    assert isinstance(failure.value, UnsupportedLanguageError)
-    assert failure.value.language == "ja"
-    model.language = "en"
     assert [type(event) for event in _collect(native, engine, speech)] == [
         UtteranceStart,
         Partial,
         Final,
         UtteranceEnd,
     ]
-    assert model.detect_calls == 2
-    _collect(native, _engine(tmp_path, language="en"), speech)
-    assert model.detect_calls == 2
+    _collect(native, engine, speech)
+    assert observed == [language, language]
+    assert model.detect_calls == (2 if language is None else 0)
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.parametrize("language", ["zz", "cmn_hans_cn", "en-US"])
+def test_unknown_language_raises_the_exported_configuration_error(tmp_path, language):
+    """Unknown language codes fail at construction through the exported configuration subtype."""
+    from listenflow.fastest_whisper import UnsupportedLanguageError
+
+    with pytest.raises(ConfigurationError, match="language") as failure:
+        _engine(tmp_path, language=language)
+    assert isinstance(failure.value, UnsupportedLanguageError)
+    assert failure.value.language == language
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-008")

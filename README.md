@@ -6,7 +6,7 @@ encoder and decoder directly from a Hugging Face checkpoint with TensorRT's Pyth
 network definition API. It does not load ONNX or distribute an engine or weights.
 The numerical entry points establish a correctness reference. `FastestWhisperEngine`
 implements the listenflow stream contract and persists its TensorRT engines through
-tensoracle.
+tensoracle. It transcribes all 100 language codes supported by Whisper large-v3.
 
 ## Install
 
@@ -77,7 +77,8 @@ errors, and TensorRT engine reuse.
 
 `FastestWhisperEngine` is the listenflow-facing entry point. Construct it with an
 `OfflineModelDirectorySource`, a required precision (`fp32`, `fp16`, or `fp8`), a required
-CUDA device number, and a required language (`en` or `None`). An optional
+CUDA device number, and a required language argument: a large-v3 language code
+such as `en`, `ja`, or `yue`, or `None` for automatic detection. An optional
 `initial_prompt` supplies text hints for recognition. It accepts 16 kHz mono
 PCM in s16le by default or little-endian f32 when `input_format=EngineInputFormat.PCM_F32`.
 `boundary_settings` defaults to `UtteranceBoundarySettings()`. The async
@@ -87,8 +88,10 @@ FP8 requires sm89 or sm120; selecting it on sm86 raises an environment error
 that offers fp32 and fp16. Its linear inputs and weights use E4M3 Q/DQ, while
 KV cache, logits and surrounding operations retain fp16 types. The package
 includes activation scales calibrated on the official large-v3 weights with
-LibriSpeech dev audio; preparation does not run calibration. Weight variants
-are accepted, but their accuracy with these scales has not been established.
+English speech; preparation does not run calibration. See
+[accuracy by language](#accuracy-by-language) for measured precision differences.
+Weight variants are accepted, but their accuracy with these scales has not been
+established.
 Changes to these scales or the FP8 graph invalidate saved FP8 engines automatically.
 Call it before reading
 `stream()`, or use `async with engine` to prepare and release the model automatically.
@@ -119,7 +122,7 @@ excluding bool, or `None`.
 Invalid decoding settings raise `ConfigurationError` during construction,
 before `prepare()` or GPU access. The engine copies the temperature sequence
 at construction and uses the selected settings for every utterance and stream,
-including both precisions, long utterances, and recognition with `initial_prompt`.
+including all three precisions, long utterances, and recognition with `initial_prompt`.
 
 Call `await engine.aclose()` when finished to return its TensorRT execution contexts,
 CUDA graphs, streams, engines, and runtimes. When stopping a stream early, close the returned
@@ -127,10 +130,13 @@ iterator explicitly with `await stream.aclose()` or `contextlib.aclosing`. Calle
 cancellation, iterator closure, and engine closure stop decoding before the next
 token and wait for the current native operation to finish.
 
-`capabilities.languages` is `frozenset({"en"})` and `capabilities.auto_language` is
-`True`. Invalid settings, including unsupported language values, raise listenflow's
-`ConfigurationError` before recognition. Environment or model-load failures raise
-`EnvironmentUnavailableError`; native recognition failures raise `InferenceError`.
+`capabilities.languages` is a `frozenset` of all 100 large-v3 language codes and
+`capabilities.auto_language` is `True`. Language codes are case-sensitive;
+unrecognized codes raise `UnsupportedLanguageError`, a `ConfigurationError`,
+during construction. Other invalid settings, including non-string language values
+other than `None`, raise listenflow's `ConfigurationError` before recognition.
+Environment or model-load failures raise `EnvironmentUnavailableError`; native
+recognition failures raise `InferenceError`.
 Mapped failures preserve their original exception in `__cause__`.
 
 Before the cached decoder and GPU feature changes, loading large-v3 took the
@@ -148,12 +154,12 @@ created by its first preparation.
 
 Loading time depends on the checkpoint storage, host, GPU, and TensorRT version.
 
-With `language="en"`, the model transcribes without language detection. With
-`language=None`, it detects each closed utterance. English is transcribed; any other
-detected code raises `UnsupportedLanguageError` (a `ConfigurationError`) from the
-stream, after which the
-instance can be reused. An utterance longer than 30 seconds uses the same timestamp
-windowing as `transcribe_long_fp32` and yields one `Final` per text segment.
+With an explicit language code, the model transcribes in that language without
+language detection. With `language=None`, it detects the language of each closed
+utterance and transcribes in the detected language, including non-English languages.
+An utterance longer than 30 seconds uses the same timestamp windowing as
+`transcribe_long_fp32` and yields one `Final` per text segment. Automatic language
+detection runs for each window of a long utterance.
 
 tensoracle stores the mel, encoder, and decoder under `$XDG_CACHE_HOME/tensoracle/`, or
 `~/.cache/tensoracle/` when `XDG_CACHE_HOME` is unset. The constructor has no cache
@@ -162,6 +168,65 @@ match, `prepare()` automatically rebuilds that engine and continues. There is no
 caller setting for rebuilding engines. If rebuilding fails or the rebuilt engine
 cannot be opened, `prepare()` raises `EnvironmentUnavailableError` and preserves the
 underlying error in `__cause__`.
+
+## Accuracy by language
+
+The following measurements use the FLEURS test split at dataset revision
+`70bb2e84b976b7e960aa89f1c648e09c59f894dd` and `openai/whisper-large-v3` at
+checkpoint revision `06f233fe06e710322aca913c1bc4249a0d71fce1`, on an NVIDIA
+RTX PRO 4000 Blackwell (sm120, 24 GB). All 6,085 test utterances across these
+nine languages were decoded at each precision with an explicit language, no
+initial prompt, the default decoding settings, and a fixed seed per utterance.
+
+Runs kept the default temperature retry sequence. Each comparison below selects
+the utterances for which both fp32 and the compared precision used only
+temperature 0, across all windows. Each precision comparison has its own matched
+subset, so its utterance count and fp32 baseline can differ from the other table.
+Utterances with higher-temperature attempts are recorded separately because
+sampling introduces variation.
+
+Rates are percentages of total edit errors divided by total reference units.
+CER counts characters; WER counts words. Text uses the official Whisper
+`EnglishTextNormalizer` for English and `BasicTextNormalizer` for the other
+languages; CER also removes whitespace after normalization. Deltas are percentage
+points relative to fp32 on the same subset, calculated before rounding.
+
+### fp16 compared with fp32
+
+| Language | Unit | Utterances | fp32 | fp16 | Delta (points) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| English (`en`) | WER | 647 | 4.032% | 4.046% | +0.014 |
+| Japanese (`ja`) | CER | 649 | 4.579% | 4.579% | +0.000 |
+| Chinese (`zh`) | CER | 945 | 8.004% | 7.996% | -0.008 |
+| Cantonese (`yue`) | CER | 811 | 21.007% | 21.027% | +0.021 |
+| Korean (`ko`) | CER | 382 | 4.904% | 4.904% | +0.000 |
+| Russian (`ru`) | WER | 775 | 4.979% | 4.979% | +0.000 |
+| Arabic (`ar`) | WER | 427 | 14.590% | 14.603% | +0.012 |
+| Hindi (`hi`) | WER | 398 | 17.275% | 17.304% | +0.029 |
+| Thai (`th`) | CER | 964 | 8.106% | 8.085% | -0.020 |
+
+Each language stays within the fp16 limit of fp32 plus 0.05 percentage points
+on these matched subsets.
+
+### fp8 compared with fp32
+
+| Language | Unit | Utterances | fp32 | fp8 | Delta (points) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| English (`en`) | WER | 647 | 4.032% | 4.094% | +0.062 |
+| Japanese (`ja`) | CER | 649 | 4.579% | 4.527% | -0.052 |
+| Chinese (`zh`) | CER | 945 | 8.004% | 7.985% | -0.020 |
+| Cantonese (`yue`) | CER | 807 | 20.699% | 21.200% | +0.501 |
+| Korean (`ko`) | CER | 382 | 4.904% | 4.672% | -0.232 |
+| Russian (`ru`) | WER | 775 | 4.979% | 4.992% | +0.013 |
+| Arabic (`ar`) | WER | 427 | 14.590% | 14.810% | +0.219 |
+| Hindi (`hi`) | WER | 400 | 17.535% | 20.522% | +2.986 |
+| Thai (`th`) | CER | 959 | 8.121% | 10.801% | +2.680 |
+
+FP8 rates are reported without a pass/fail threshold. The shipped activation
+scales were calibrated on English speech. FP8 is about 3 percentage points worse
+than fp32 for Hindi (+2.986 WER points) and Thai (+2.680 CER points), with smaller
+increases for Cantonese (+0.501 CER points) and Arabic (+0.219 WER points).
+For these languages, choose `fp16` or `fp32`.
 
 ## Versioning
 

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ._audio import HOP_SIZE, N_SAMPLES
-from ._decoding import DecodingSettings
+from ._decoding import DecodingSettings, should_skip_window
 
 SAMPLE_RATE = 16_000
 N_FRAMES = N_SAMPLES // HOP_SIZE
@@ -126,15 +126,12 @@ def transcribe_mel(
         result = decode(window, all_tokens[prompt_reset_since:].copy())
         tokens = result.tokens
         next_seek = seek + segment_size
-        skip_silence = (
-            no_speech_threshold is not None and result.no_speech_prob > no_speech_threshold
+        skip_silence = should_skip_window(
+            result.no_speech_prob,
+            result.avg_logprob,
+            no_speech_threshold=no_speech_threshold,
+            logprob_threshold=logprob_threshold,
         )
-        if (
-            skip_silence
-            and logprob_threshold is not None
-            and result.avg_logprob > logprob_threshold
-        ):
-            skip_silence = False
         if not skip_silence:
             offset = seek * HOP_SIZE / SAMPLE_RATE
             timestamp_flags = [token >= timestamp_begin for token in tokens]

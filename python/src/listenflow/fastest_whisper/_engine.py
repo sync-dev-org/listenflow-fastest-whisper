@@ -37,17 +37,18 @@ from listenflow import (
 )
 
 from ._decoding import DecodingSettings, decoding_settings
+from ._languages import LANGUAGES
 from ._precision import PRECISIONS, Precision
 
 _DEFAULT_BOUNDARY_SETTINGS = UtteranceBoundarySettings()
 
 
 class UnsupportedLanguageError(ConfigurationError):
-    """The detector selected a language that this engine cannot transcribe."""
+    """The caller selected a language without a large-v3 language token."""
 
     def __init__(self, language: str):
         self.language = language
-        super().__init__(f"detected unsupported language: {language}")
+        super().__init__(f"unsupported language: {language!r}; use a large-v3 language code")
 
 
 def _cuda_device_info(device: int) -> tuple[int, tuple[int, int] | None]:
@@ -131,13 +132,9 @@ class FastestWhisperEngine(STTEngineBase):
             raise ConfigurationError("device must be a non-negative integer")
         if language is not None:
             if not isinstance(language, str):
-                raise ConfigurationError("language must be 'en' or None")
-            if language != "en":
-                if language in ("English", "en-US", "EN", "en_us", "eng"):
-                    raise ConfigurationError(f"language {language!r} is invalid; use 'en'")
-                raise ConfigurationError(
-                    f"language {language!r} is not supported; only 'en' is supported"
-                )
+                raise ConfigurationError("language must be a large-v3 language code or None")
+            if language not in LANGUAGES:
+                raise UnsupportedLanguageError(language)
         if initial_prompt is not None:
             if not isinstance(initial_prompt, str):
                 raise ConfigurationError("initial_prompt must be None or a non-empty string")
@@ -197,7 +194,7 @@ class FastestWhisperEngine(STTEngineBase):
             finalization=frozenset((FinalizationMode.LOCAL_VAD, FinalizationMode.CLIENT_FLUSH)),
             timestamp_detail=TimestampDetail.SEGMENT,
             diarization=DiarizationMode.NONE,
-            languages=frozenset({"en"}),
+            languages=LANGUAGES,
             auto_language=True,
             single_utterance=True,
         )
@@ -309,13 +306,10 @@ class FastestWhisperEngine(STTEngineBase):
             model._cancel_requested = cancelled
             try:
                 _check_cancelled(cancelled)
-                if self.language is None:
-                    detected = model.detect_language(audio)
-                    if detected != "en":
-                        raise UnsupportedLanguageError(detected)
                 settings = self._decoding_settings
                 segments = model.transcribe(
                     audio,
+                    language=self.language,
                     initial_prompt=self.initial_prompt,
                     beam_size=settings.beam_size,
                     temperature=settings.temperatures,

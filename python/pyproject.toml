@@ -93,6 +93,7 @@ evaluation = [
     "faster-whisper==1.2.1",
     "jiwer",
     "openai-whisper==20250625",
+    "pyarrow",
     "soundfile",
     "torch>=2.0",
     "transformers",

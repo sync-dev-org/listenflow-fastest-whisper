@@ -504,6 +504,7 @@ def short_audio(tmp_path, monkeypatch, cpu_tensor_rt):
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
+@pytest.mark.req("SP-LFFASTESTWHISPER-002")
 @pytest.mark.parametrize("precision", ["fp16", "fp32"])
 @pytest.mark.parametrize("configured", [False, True])
 def test_wer_cli_passes_settings_and_keeps_default_csv_and_metadata(
@@ -541,14 +542,9 @@ def test_wer_cli_passes_settings_and_keeps_default_csv_and_metadata(
     settings = SETTINGS if configured else DecodingSettings(temperatures=(0.0,), best_of=1)
     assert short_audio == [(precision, [], settings)] * 2
     assert cpu_tensor_rt.closed_engines == ["decoder", "encoder", "mel"]
-    if configured:
-        assert cpu_tensor_rt.greedy_calls == []
-        assert cpu_tensor_rt.fallback_calls == [asdict(settings)] * 2
-        assert cpu_tensor_rt.attempt_calls == [(0.0, 2, None)] * 2
-    else:
-        assert cpu_tensor_rt.greedy_calls == [precision] * 2
-        assert cpu_tensor_rt.fallback_calls == []
-        assert cpu_tensor_rt.attempt_calls == []
+    assert cpu_tensor_rt.greedy_calls == []
+    assert cpu_tensor_rt.fallback_calls == [asdict(settings)] * 2
+    assert cpu_tensor_rt.attempt_calls == [(0.0, 2 if configured else None, None)] * 2
     if configured:
         assert baseline.read_bytes() == b"existing default result\n"
         assert (tmp_path / f"{precision}.json").read_bytes() == b"existing metadata\n"

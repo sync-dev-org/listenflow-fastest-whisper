@@ -10,6 +10,7 @@ from scripts.generate_oracle import read_pcm16_mono
 
 from listenflow.fastest_whisper import _inference, transcribe_fp32, transcribe_long_fp32
 from listenflow.fastest_whisper._audio import log_mel_spectrogram
+from listenflow.fastest_whisper._cached_model import CachedWhisper
 from listenflow.fastest_whisper._decoding import DecodingSettings
 from listenflow.fastest_whisper._inference import TensorRTWhisper
 
@@ -210,3 +211,66 @@ def test_prompted_long_beam_matches_official_segments_and_window_tokens(model, m
         call["tokens"] for call in oracle["decode_calls"]
     ]
     assert prompts == [call["prompt"] for call in oracle["decode_calls"]]
+
+
+@pytest.fixture(scope="module")
+def multilingual_model():
+    checkpoint = os.environ.get("LFFW_CHECKPOINT_DIR")
+    if os.environ.get("LFFW_USE_GPU") != "1" or not checkpoint:
+        pytest.skip("set LFFW_USE_GPU=1 and LFFW_CHECKPOINT_DIR to run GPU comparisons")
+    with CachedWhisper(Path(checkpoint), precision="fp32") as instance:
+        yield instance
+
+
+@pytest.mark.gpu
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.req("SP-LFFASTESTWHISPER-040")
+@pytest.mark.parametrize("language", ["en", "ja", "zh", "yue", "ko", "ru", "ar", "hi", "th"])
+def test_fp32_multilingual_explicit_and_detected_language_match_official(
+    multilingual_model, monkeypatch, language
+):
+    """Each representative language matches official fp32 arrays, tokens, and automatic transcription."""
+    model = multilingual_model
+    root = FIXTURES / "oracle/multilingual"
+    case = json.loads((root / "metadata.json").read_text())["fixtures"][language]
+    samples = read_pcm16_mono(FIXTURES / f"{case['name']}.wav")
+    with np.load(root / case["oracle_file"]) as oracle:
+        reference = {field: oracle[field] for field in oracle.files}
+        initial = oracle["initial_tokens"].tolist()
+        tokens = oracle["greedy_tokens"].tolist()
+
+    model._set_language(language)
+    assert model.initial_tokens == initial
+    mel = log_mel_spectrogram(samples, n_mels=model.config.n_mels)
+    encoder = model.encode(mel)
+    raw_logits = model.logits(initial + tokens[:-1], encoder)
+    actual = model.greedy_decode(encoder)
+    step_logits = raw_logits[len(initial) - 1 :]
+    if case["reference_format"] == "full":
+        np.testing.assert_allclose(mel, reference["mel"], atol=3e-5, rtol=3e-5)
+        np.testing.assert_allclose(encoder, reference["encoder"], atol=2e-2, rtol=5e-3)
+        np.testing.assert_allclose(step_logits, reference["logits"], atol=2e-2, rtol=2e-2)
+    else:
+        np.testing.assert_allclose(
+            np.take_along_axis(step_logits, reference["logit_token_ids"], axis=-1),
+            reference["logit_values"],
+            atol=2e-2,
+            rtol=2e-2,
+        )
+    assert actual.tokens == tokens
+    assert actual.text == case["text"]
+
+    explicit = model.transcribe(samples, language=language, temperature=0.0, best_of=1)
+    assert [segment.text for segment in explicit] == [case["text"]]
+    assert model.detect_language(samples) == case["detected_language"]
+    selected = []
+    set_language = model._set_language
+
+    def record_language(code):
+        selected.append(code)
+        set_language(code)
+
+    monkeypatch.setattr(model, "_set_language", record_language)
+    automatic = model.transcribe(samples, language=None, temperature=0.0, best_of=1)
+    assert selected == [case["detected_language"]]
+    assert [segment.text for segment in automatic] == [case["auto_text"]]

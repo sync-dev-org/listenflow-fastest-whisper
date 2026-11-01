@@ -29,8 +29,10 @@ from ._decoding import (
     decode_with_fallback,
     decoding_settings,
     search_candidates,
+    should_skip_window,
 )
 from ._engines import _open_mel_engine, open_whisper_engine
+from ._languages import LANGUAGES
 from ._longform import (
     DecodedWindow,
     LongTranscription,
@@ -1004,6 +1006,30 @@ class TensorRTWhisper:
             return []
         return self.tokenizer.encode(" " + initial_prompt.strip(), add_special_tokens=False).ids
 
+    def _set_language(self, language: str) -> None:
+        """Select the language token for subsequent short and timestamped decodes."""
+        token = self.tokenizer.token_to_id(f"<|{language}|>")
+        if language not in LANGUAGES or token is None:
+            raise ValueError(f"checkpoint tokenizer has no language token for {language!r}")
+        self.initial_tokens = [self.initial_tokens[0], token, *self.initial_tokens[2:]]
+
+    def _detect_language(self, encoder: _EncodedAudio) -> str:
+        """Choose only among large-v3 language tokens using the start-token logits."""
+        logits = self.logits([self.initial_tokens[0]], encoder)[-1]
+        candidates = {
+            token_id: language
+            for language in sorted(LANGUAGES)
+            if (token_id := self.tokenizer.token_to_id(f"<|{language}|>")) is not None
+        }
+        if not candidates:
+            raise ValueError("checkpoint tokenizer has no language tokens")
+        return candidates[max(candidates, key=lambda token_id: float(logits[token_id]))]
+
+    def detect_language(self, audio: np.ndarray) -> str:
+        """Detect the language of at most one audio window."""
+        mel = self._mel_spectrogram(audio[:N_SAMPLES])
+        return self._detect_language(self.encode(mel))
+
     def _clear_greedy_cache(self):
         cache, self._greedy_cache = getattr(self, "_greedy_cache", {}), {}
         _release_tensors(cache)
@@ -1148,7 +1174,7 @@ class TensorRTWhisper:
     def decode_short(
         self, encoder: _EncodedAudio, prompt: list[int], settings: DecodingSettings
     ) -> Transcription:
-        if settings.greedy_only:
+        if settings.greedy_only and settings.no_speech_threshold is None:
             return self.greedy_decode(encoder, prompt)
         result = decode_with_fallback(
             lambda temperature, beam_size, best_of: self._decode_attempt(
@@ -1166,7 +1192,13 @@ class TensorRTWhisper:
             logprob_threshold=settings.logprob_threshold,
             no_speech_threshold=settings.no_speech_threshold,
         )
-        return Transcription(result.text, result.tokens + [self.eot])
+        skip_silence = should_skip_window(
+            result.no_speech_prob,
+            result.avg_logprob,
+            no_speech_threshold=settings.no_speech_threshold,
+            logprob_threshold=settings.logprob_threshold,
+        )
+        return Transcription("" if skip_silence else result.text, result.tokens + [self.eot])
 
     def decode_long(
         self, encoder: _EncodedAudio, prompt: list[int], settings: DecodingSettings

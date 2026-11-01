@@ -29,7 +29,6 @@ from listenflow import (
 )
 from listenflow.fastest_whisper import (
     FastestWhisperEngine,
-    UnsupportedLanguageError,
     transcribe_fp16,
     transcribe_long_fp32,
 )
@@ -352,19 +351,36 @@ def test_long_utterance_matches_long_fp32_segments(gpu, engine_loop, monkeypatch
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-019")
-def test_auto_detects_english_and_rejects_japanese(gpu, engine_loop):
-    """Automatic detection transcribes English and reports the official Japanese code."""
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+def test_auto_detects_and_transcribes_english_and_japanese(gpu, engine_loop):
+    """Automatic detection transcribes English and Japanese with their explicit language results."""
     english = _pcm("small_boat_16khz_mono_s16le.wav")
+    japanese = _pcm("ja_pronunciation_practice5_25s_16khz_mono_s16le.wav")
     automatic = _engine(gpu, language=None)
-    fixed = _engine(gpu, language="en")
-    assert [
+    actual_english = [
         event.text for event in _events(engine_loop, automatic, english) if isinstance(event, Final)
-    ] == [event.text for event in _events(engine_loop, fixed, english) if isinstance(event, Final)]
-    japanese_path = FIXTURES / "ja_pronunciation_practice5_25s_16khz_mono_s16le.wav"
-    japanese = _pcm(japanese_path.name)
-    with pytest.raises(UnsupportedLanguageError) as failure:
-        _events(engine_loop, automatic, japanese)
-    assert failure.value.language == "ja"
+    ]
+    actual_japanese = [
+        event.text
+        for event in _events(engine_loop, automatic, japanese)
+        if isinstance(event, Final)
+    ]
+    engine_loop.run(automatic.aclose())
+    fixed = _engine(gpu, language="en")
+    expected_english = [
+        event.text for event in _events(engine_loop, fixed, english) if isinstance(event, Final)
+    ]
+    engine_loop.run(fixed.aclose())
+    fixed_japanese = _engine(gpu, language="ja")
+    expected_japanese = [
+        event.text
+        for event in _events(engine_loop, fixed_japanese, japanese)
+        if isinstance(event, Final)
+    ]
+    engine_loop.run(fixed_japanese.aclose())
+    assert actual_english == expected_english
+    assert actual_japanese == expected_japanese
+    assert actual_japanese
 
 
 @pytest.mark.gpu

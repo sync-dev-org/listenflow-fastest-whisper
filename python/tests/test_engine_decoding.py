@@ -19,6 +19,7 @@ from listenflow import (
 )
 from listenflow.fastest_whisper import FastestWhisperEngine
 from listenflow.fastest_whisper._cached_model import CachedWhisper
+from listenflow.fastest_whisper._decoding import decoding_settings
 
 DEFAULTS = {
     "beam_size": 1,
@@ -35,7 +36,7 @@ def _engine(tmp_path, **options):
         model_source=OfflineModelDirectorySource(str(tmp_path)),
         precision=options.pop("precision", "fp32"),
         device=0,
-        language="en",
+        language=options.pop("language", "en"),
         boundary_settings=UtteranceBoundarySettings(preroll_s=0),
         **options,
     )
@@ -48,7 +49,16 @@ def runtime(monkeypatch):
 
     monkeypatch.setattr(engine_module, "_cuda_device_info", lambda _device: (1, (12, 0)))
 
-    def install(*, repeated=False, no_speech=0.1, starts=(1,), by_temperature=False, prefixes=None):
+    def install(
+        *,
+        repeated=False,
+        no_speech=0.1,
+        starts=(1,),
+        by_temperature=False,
+        detected_languages=("en",),
+        prefixes=None,
+        first_probabilities=None,
+    ):
         word = "A" * 100 if repeated else "A"
         vocab = {
             word: 0,
@@ -63,6 +73,11 @@ def runtime(monkeypatch):
             "<|startofprev|>": 9,
             "hint": 10,
             **{f"<|{index * 0.02:.2f}|>": 11 + index for index in range(51)},
+            **{
+                f"<|{code}|>": 62 + index
+                for index, code in enumerate(("ja", "zh", "yue", "ko", "ru", "ar", "hi", "th"))
+            },
+            "<|xyz|>": 70,
         }
         tokenizer = Tokenizer(WordLevel(vocab, unk_token="hint"))
         tokenizer.pre_tokenizer = Whitespace()
@@ -94,15 +109,21 @@ def runtime(monkeypatch):
 
             def encode(self, _mel):
                 self.encoded_windows += 1
-                return np.empty(0, dtype=np.float32)
+                return np.array([self.encoded_windows - 1], dtype=np.float32)
 
-            def logits(self, prefix, _encoder):
+            def logits(self, prefix, encoder):
                 if prefixes is not None:
                     prefixes.append(prefix.copy())
+                if prefix == [5]:
+                    output = np.full((1, len(vocab)), -np.inf, dtype=np.float32)
+                    index = min(int(encoder[0]), len(detected_languages) - 1)
+                    output[0, vocab[f"<|{detected_languages[index]}|>"]] = 1
+                    output[0, vocab["<|xyz|>"]] = 10
+                    return output
                 task = len(prefix) - 1 - prefix[::-1].index(7)
                 long = len(prefix) <= task + 1 or prefix[task + 1] != 8
                 generated = prefix[task + (1 if long else 2) :]
-                output = np.full((len(prefix), 62), -np.inf, dtype=np.float32)
+                output = np.full((len(prefix), len(vocab)), -np.inf, dtype=np.float32)
                 output[task - 2, 4] = log(no_speech)
                 output[task - 2, 0] = log(1 - no_speech)
                 if long and not generated:
@@ -119,6 +140,8 @@ def runtime(monkeypatch):
                     (0,): {2: 0.51, end: 0.49},
                     (1,): {2: 0.01, end: 0.99},
                 }.get(tuple(generated), {end: 1.0})
+                if first_probabilities is not None:
+                    probabilities = first_probabilities if not generated else {end: 1.0}
                 for token, probability in probabilities.items():
                     output[-1, token] = log(probability)
                 return output
@@ -139,6 +162,59 @@ def runtime(monkeypatch):
     return install
 
 
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.parametrize("language", ["en", "ja", "zh", "yue", "ko", "ru", "ar", "hi", "th"])
+@pytest.mark.parametrize("seconds", [1, 31])
+def test_explicit_language_is_used_in_short_and_long_decoder_prompts(
+    tmp_path, runtime, language, seconds
+):
+    """Explicit language controls every decoder prompt without running language detection."""
+    prefixes = []
+    runtime(prefixes=prefixes)
+    engine = _engine(tmp_path, language=language, temperature=0.0)
+    with asyncio.Runner() as runner:
+        assert _texts(runner, engine, seconds=seconds) == ["A C"] * (2 if seconds > 30 else 1)
+        expected = engine._model.tokenizer.token_to_id(f"<|{language}|>")
+        assert prefixes and all(prefix != [5] for prefix in prefixes)
+        assert {prefix[prefix.index(5) + 1] for prefix in prefixes} == {expected}
+        runner.run(engine.aclose())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+def test_automatic_language_is_redetected_and_selected_for_each_long_audio_window(
+    tmp_path, runtime
+):
+    """Each long-audio window uses its own detected language token, including Cantonese."""
+    prefixes = []
+    runtime(detected_languages=("ja", "yue"), prefixes=prefixes)
+    engine = _engine(tmp_path, language=None, temperature=0.0)
+    with asyncio.Runner() as runner:
+        assert _texts(runner, engine, seconds=31) == ["A C", "A C"]
+        assert prefixes.count([5]) == 2
+        prompts = [prefix for prefix in prefixes if prefix != [5]]
+        languages = [prefix[prefix.index(5) + 1] for prefix in prompts]
+        ja = engine._model.tokenizer.token_to_id("<|ja|>")
+        yue = engine._model.tokenizer.token_to_id("<|yue|>")
+        assert languages[0] == ja and languages[-1] == yue
+        assert set(languages) == {ja, yue}
+        runner.run(engine.aclose())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.parametrize("language", ["ja", "yue"])
+def test_automatic_short_decode_uses_the_detected_language(tmp_path, runtime, language):
+    """A short utterance transcribes with the detected language rather than defaulting to English."""
+    prefixes = []
+    runtime(detected_languages=(language,), prefixes=prefixes)
+    engine = _engine(tmp_path, language=None, temperature=0.0)
+    with asyncio.Runner() as runner:
+        assert _texts(runner, engine) == ["A C"]
+        assert prefixes.count([5]) == 1
+        expected = engine._model.tokenizer.token_to_id(f"<|{language}|>")
+        assert {prefix[1] for prefix in prefixes if prefix != [5]} == {expected}
+        runner.run(engine.aclose())
+
+
 def _texts(runner, engine, *, seconds=1, utterances=1):
     pcm = np.full(seconds * 16000, 1000, dtype="<i2").tobytes()
 
@@ -153,6 +229,74 @@ def _texts(runner, engine, *, seconds=1, utterances=1):
         return [event.text async for event in engine.stream(chunks()) if isinstance(event, Final)]
 
     return runner.run(collect())
+
+
+# Ten equally likely initial tokens followed by certain EOT give avg_logprob < -1.
+LOW_CONFIDENCE_TOKENS = {token: 0.1 for token in (0, 1, 2, 3, *range(11, 17))}
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-002")
+@pytest.mark.parametrize(
+    ("no_speech", "first_probabilities", "temperature", "thresholds", "expected"),
+    [
+        pytest.param(0.8, LOW_CONFIDENCE_TOKENS, (0.0, 0.4), {}, [], id="silent-final-attempt"),
+        pytest.param(0.8, LOW_CONFIDENCE_TOKENS, 0.4, {}, [], id="single-temperature"),
+        pytest.param(0.8, None, (0.0, 0.4), {}, ["A C"], id="good-logprob-keeps-text"),
+        pytest.param(
+            0.5,
+            LOW_CONFIDENCE_TOKENS,
+            0.4,
+            {"no_speech_threshold": 0.5},
+            ["A"],
+            id="equal-no-speech-prob-keeps-text",
+        ),
+        pytest.param(
+            0.8,
+            {0: 1.0},
+            0.4,
+            {"logprob_threshold": 0.0},
+            [],
+            id="equal-logprob-skips-text",
+        ),
+        pytest.param(0.8, None, 0.4, {"logprob_threshold": None}, [], id="no-logprob-override"),
+        pytest.param(
+            0.8,
+            LOW_CONFIDENCE_TOKENS,
+            0.4,
+            {"no_speech_threshold": None},
+            ["A"],
+            id="disabled-no-speech-threshold",
+        ),
+    ],
+)
+def test_short_silence_follows_official_probability_thresholds(
+    tmp_path, runtime, no_speech, first_probabilities, temperature, thresholds, expected
+):
+    """Short utterances skip silent text unless speech probability or log probability allows it."""
+    runtime(no_speech=no_speech, starts=(0,), first_probabilities=first_probabilities)
+    with asyncio.Runner() as runner:
+        engine = _engine(tmp_path, temperature=temperature, **thresholds)
+        assert _texts(runner, engine) == expected
+        runner.run(engine.aclose())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-002")
+def test_greedy_silence_skips_short_window_without_changing_decoded_tokens(tmp_path, runtime):
+    """Greedy short utterances suppress silent text while preserving the selected tokens."""
+    from listenflow.fastest_whisper import _cached_model
+
+    runtime(no_speech=0.8, first_probabilities=LOW_CONFIDENCE_TOKENS)
+    model = _cached_model.CachedWhisper(tmp_path, precision="fp32")
+    audio = np.zeros(16000, dtype=np.float32)
+    encoder = model.encode(model._mel_spectrogram(audio))
+
+    unscored = model.greedy_decode(encoder, [10])
+    result = model.decode_short(encoder, [10], decoding_settings(temperature=0.0))
+
+    assert unscored.text == "A"
+    assert result.tokens == unscored.tokens == [0, 3]
+    assert result.text == ""
+    assert model.transcribe(audio, initial_prompt="hint", temperature=0.0) == []
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-019")

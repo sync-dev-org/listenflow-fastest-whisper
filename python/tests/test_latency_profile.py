@@ -424,7 +424,9 @@ def cpu_native(monkeypatch):
     )
     model.initial_tokens, model.eot = [1, 2, 3, 4], 5
     model.suppressed, model.begin_suppressed = {7}, {5}
-    model.tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0, "hello": 8}, unk_token="[UNK]"))
+    model.tokenizer = Tokenizer(
+        models.WordLevel({"[UNK]": 0, "<|en|>": 2, "hello": 8}, unk_token="[UNK]")
+    )
     model._encoder = _HostIO(EngineHandle(Engine(False), object(), Path("encoder.engine")))
     model._decoder = _HostIO(EngineHandle(Engine(True), object(), Path("decoder.engine")))
     model._test_transfers = transfers
