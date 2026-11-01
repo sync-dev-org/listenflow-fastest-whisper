@@ -24,8 +24,10 @@ from tokenizers import Tokenizer
 from ._audio import FFT_SIZE, HOP_SIZE, N_SAMPLES
 from ._checkpoint import Checkpoint, ModelConfig
 from ._decoding import (
+    Candidate,
     DecodeAttempt,
     DecodingSettings,
+    _rank,
     decode_with_fallback,
     decoding_settings,
     search_candidates,
@@ -38,6 +40,7 @@ from ._longform import (
     LongTranscription,
     SegmentTrace,
     WindowTrace,
+    apply_timestamp_constraints,
     apply_timestamp_rules,
     decoder_prefix,
     transcribe_mel,
@@ -188,12 +191,39 @@ class _TensorIO:
     host: np.ndarray | None = None
 
 
+class _WorkspaceEngine:
+    """Create contexts sharing scratch storage on one owning decoder stream."""
+
+    def __init__(self, engine, pointer, nbytes):
+        self.engine, self.pointer, self.nbytes = engine, pointer, nbytes
+
+    def __getattr__(self, name):
+        return getattr(self.engine, name)
+
+    def create_execution_context(self):
+        context = self.engine.create_execution_context(
+            trt.ExecutionContextAllocationStrategy.USER_MANAGED
+        )
+        if context is not None:
+            context.set_device_memory(self.pointer, self.nbytes)
+        return context
+
+
 class _CudaGraphs:
     """Retain one immutable execution context for each padded decoder length interval."""
 
-    def __init__(self, handle: EngineHandle):
+    def __init__(self, handle: EngineHandle, *, share_workspace: bool = False):
         self.handle = handle
         self.entries = {}
+        self._workspace = None
+        if share_workspace:
+            size = handle.engine.device_memory_size_v2
+            self._workspace = _cuda(cudart.cudaMalloc(max(1, size)), "cudaMalloc decoder workspace")
+            self.handle = EngineHandle(
+                _WorkspaceEngine(handle.engine, int(self._workspace), size),
+                handle.runtime,
+                handle.path,
+            )
 
     @staticmethod
     def _release(entry):
@@ -205,9 +235,14 @@ class _CudaGraphs:
 
     def close(self):
         entries, self.entries = self.entries, {}
-        for entry in entries.values():
-            self._release(entry)
-        self.handle = None
+        try:
+            for entry in entries.values():
+                self._release(entry)
+        finally:
+            self.handle = None
+            workspace, self._workspace = self._workspace, None
+            if workspace is not None:
+                _cuda(cudart.cudaFree(workspace), "cudaFree decoder workspace")
 
     def enqueue(self, execution, addresses, *, stream):
         shapes = {name: execution.get_tensor_shape(name) for name in execution._ranges}
@@ -274,7 +309,7 @@ class _HostIO:
             )
             self.outputs = tuple(name for name in names if name not in self.inputs)
             if "logits" in self.outputs:
-                self._graphs = _CudaGraphs(handle)
+                self._graphs = _CudaGraphs(handle, share_workspace="sampled" in self.outputs)
             self.ranged_inputs = tuple(
                 name
                 for name in self.inputs
@@ -327,6 +362,8 @@ class _HostIO:
                                 _cuda(cudart.cudaEventDestroy(completion), "cudaEventDestroy")
                         finally:
                             _cuda(cudart.cudaStreamDestroy(stream), "cudaStreamDestroy")
+            elif graphs is not None:
+                graphs.close()
         finally:
             try:
                 buffers, self._buffers = self._buffers, {}
@@ -729,7 +766,14 @@ def _suppressed_tokens(tokenizer: Tokenizer) -> set[int]:
 class TensorRTWhisper:
     """Own the two TensorRT engines during one comparison or transcription."""
 
-    def __init__(self, checkpoint_dir: Path, *, precision: str = "fp32", device: int = 0):
+    def __init__(
+        self,
+        checkpoint_dir: Path,
+        *,
+        precision: str = "fp32",
+        device: int = 0,
+        settings: DecodingSettings | None = None,
+    ):
         if precision not in PRECISIONS:
             raise ValueError(f"unsupported precision: {precision}")
         self.checkpoint_dir = Path(checkpoint_dir)
@@ -739,6 +783,14 @@ class TensorRTWhisper:
         self.encoder_engine = self.decoder_engine = None
         self._encoder_handle = self._decoder_handle = None
         self._mel_handle = None
+        self._sampled_handle = self._sampled_decoder = None
+        self._sampled_batch = (
+            settings.best_of
+            if settings is not None
+            and settings.best_of > 1
+            and any(value > 0 for value in settings.temperatures)
+            else None
+        )
         self._mel_tensor = None
         self._encoded_audio: _EncodedAudio | None = None
         self._prefix_states: dict[tuple[int, ...], _PrefixState] = {}
@@ -758,9 +810,17 @@ class TensorRTWhisper:
                 self._decoder_handle = self._open_engine(checkpoint, decoder=True)
                 self.decoder_engine = self._decoder_handle.engine
                 self._mel_handle = self._open_mel(checkpoint)
+                if self._sampled_batch is not None:
+                    started = monotonic()
+                    self._sampled_handle = self._open_sampled_engine(
+                        checkpoint, batch_size=self._sampled_batch
+                    )
+                    self.build_seconds["sampled_decoder"] = monotonic() - started
             self._encoder = _HostIO(self._encoder_handle, device=device)
             self._decoder = _HostIO(self._decoder_handle, device=device)
             self._mel = _HostIO(self._mel_handle, device=device)
+            if self._sampled_handle is not None:
+                self._sampled_decoder = _HostIO(self._sampled_handle, device=device)
             required = (
                 "<|startoftranscript|>",
                 "<|en|>",
@@ -793,6 +853,16 @@ class TensorRTWhisper:
         self.build_seconds[name] = monotonic() - build_started
         return handle
 
+    def _open_sampled_engine(self, checkpoint: Checkpoint, *, batch_size: int):
+        return open_whisper_engine(
+            checkpoint,
+            decoder=True,
+            precision=self.precision,
+            logger=self.logger,
+            sample_batch=batch_size,
+            force_rebuild=True,
+        )
+
     def _open_mel(self, checkpoint: Checkpoint):
         started = monotonic()
         handle = _open_mel_engine(
@@ -812,6 +882,7 @@ class TensorRTWhisper:
         decoder, self._decoder = getattr(self, "_decoder", None), None
         encoder, self._encoder = getattr(self, "_encoder", None), None
         mel, self._mel = getattr(self, "_mel", None), None
+        sampled, self._sampled_decoder = getattr(self, "_sampled_decoder", None), None
         try:
             self._clear_prefix_states()
             self._clear_greedy_cache()
@@ -836,8 +907,13 @@ class TensorRTWhisper:
                         if mel is not None:
                             mel.close()
                     finally:
-                        self.decoder_engine = self.encoder_engine = None
-                        self._decoder_handle = self._encoder_handle = self._mel_handle = None
+                        try:
+                            if sampled is not None:
+                                sampled.close()
+                        finally:
+                            self.decoder_engine = self.encoder_engine = None
+                            self._decoder_handle = self._encoder_handle = self._mel_handle = None
+                            self._sampled_handle = None
 
     def _mel_spectrogram(self, audio: np.ndarray):
         self._check_cancelled()
@@ -1013,12 +1089,12 @@ class TensorRTWhisper:
             raise ValueError(f"checkpoint tokenizer has no language token for {language!r}")
         self.initial_tokens = [self.initial_tokens[0], token, *self.initial_tokens[2:]]
 
-    def _detect_language(self, encoder: _EncodedAudio) -> str:
-        """Choose only among large-v3 language tokens using the start-token logits."""
+    def _detect_language(self, encoder: _EncodedAudio, languages: list[str] | None = None) -> str:
+        """Choose among the supplied languages, or all large-v3 codes, using start-token logits."""
         logits = self.logits([self.initial_tokens[0]], encoder)[-1]
         candidates = {
             token_id: language
-            for language in sorted(LANGUAGES)
+            for language in sorted(LANGUAGES if languages is None else languages)
             if (token_id := self.tokenizer.token_to_id(f"<|{language}|>")) is not None
         }
         if not candidates:
@@ -1123,6 +1199,16 @@ class TensorRTWhisper:
             previous_token=previous,
             text_positions=self.config.text_positions,
         )
+        if (
+            temperature > 0
+            and sample_token is None
+            and getattr(self, "_sampled_decoder", None) is not None
+            and best_of == self._sampled_batch
+        ):
+            chosen, no_speech_prob = self._sampled_candidates(
+                encoder, prefix, temperature=temperature, with_timestamps=with_timestamps
+            )
+            return self._candidate_attempt(chosen, no_speech_prob, temperature)
         first_logits = self.logits(prefix, encoder)
         if no_speech is None:
             no_speech_prob = float("nan")
@@ -1158,6 +1244,9 @@ class TensorRTWhisper:
             best_of=best_of,
             sample_token=sample_token,
         )
+        return self._candidate_attempt(chosen, no_speech_prob, temperature)
+
+    def _candidate_attempt(self, chosen, no_speech_prob, temperature):
         text_tokens = [token for token in chosen.tokens if token < self.eot]
         text = self.tokenizer.decode(text_tokens, skip_special_tokens=False).strip()
         text_bytes = text.encode("utf-8")
@@ -1170,6 +1259,94 @@ class TensorRTWhisper:
             compression_ratio,
             temperature,
         )
+
+    def _sampled_candidates(self, encoder, prefix, *, temperature, with_timestamps):
+        """Advance all candidates together, retaining only K/V and the sampled result."""
+        c = self.config
+        batch = self._sampled_batch
+        paths = [[] for _ in range(batch)]
+        scores = np.zeros(batch, dtype=np.float32)
+        finished = np.zeros(batch, dtype=bool)
+        dtype = np.dtype(PRECISIONS[self.precision].dtype)
+        empty_shape = (c.text_layers, batch, c.text_heads, 1, c.audio_state // c.text_heads)
+        cache = {name: np.zeros(empty_shape, dtype) for name in ("self_keys", "self_values")}
+        generator = np.random.default_rng()
+        timestamp_begin = self.tokenizer.token_to_id("<|0.00|>") if with_timestamps else None
+        no_timestamps = self.tokenizer.token_to_id("<|notimestamps|>") if with_timestamps else None
+        speech_position = len(prefix) - (3 if with_timestamps else len(self.initial_tokens))
+        no_speech_prob = float("nan")
+
+        def step(tokens, position, *, first, select):
+            nonlocal cache, no_speech_prob
+            self._check_cancelled()
+            suppression = np.zeros((batch, 1, c.vocab_size), dtype=np.float32)
+            suppression[..., list(self.suppressed)] = -np.inf
+            if first:
+                suppression[..., list(self.begin_suppressed)] = -np.inf
+            if with_timestamps:
+                suppression[..., no_timestamps] = -np.inf
+                for row, path in zip(suppression[:, 0], paths, strict=True):
+                    apply_timestamp_constraints(
+                        row, path, timestamp_begin=timestamp_begin, eot=self.eot
+                    )
+            mask = np.zeros((1, 1, 1, position + 2), np.float32)
+            mask.flat[0] = -np.inf
+            outputs = self._sampled_decoder.run(
+                {
+                    "tokens": np.asarray(tokens, dtype=np.int32).reshape(batch, 1),
+                    "positions": np.full((batch, 1), position, dtype=np.int32),
+                    "mask": mask,
+                    **cache,
+                    "cross_keys": encoder.tensors["cross_keys"],
+                    "cross_values": encoder.tensors["cross_values"],
+                    "suppression": suppression,
+                    "temperature": np.full((1, 1, 1), temperature, np.float32),
+                    "uniform": generator.random((batch, 1, 1), dtype=np.float32)
+                    if select
+                    else np.zeros((batch, 1, 1), np.float32),
+                    "timestamps": np.full((1, 1, 1), with_timestamps, dtype=bool),
+                },
+                device_outputs=("logits", "present_keys", "present_values"),
+                reuse_cache=True,
+            )
+            _release_tensors(cache)
+            cache = {
+                "self_keys": outputs["present_keys"],
+                "self_values": outputs["present_values"],
+            }
+            _release_tensors({"logits": outputs["logits"]})
+            sampled = outputs["sampled"].reshape(batch, 3)
+            if position == speech_position:
+                no_speech_prob = float(sampled[0, 2])
+            return sampled
+
+        try:
+            for position, token in enumerate(prefix):
+                sampled = step(
+                    [token] * batch, position, first=True, select=position == len(prefix) - 1
+                )
+            for index in range(c.text_positions // 2):
+                active = ~finished
+                if not np.isfinite(sampled[active, 1]).all():
+                    raise ValueError("all decoder tokens were suppressed")
+                scores[active] += sampled[active, 1]
+                tokens = sampled[:, 0].astype(np.int32)
+                for row in np.flatnonzero(active):
+                    if tokens[row] == self.eot:
+                        finished[row] = True
+                    else:
+                        paths[row].append(int(tokens[row]))
+                if finished.all() or len(prefix) + index + 1 > c.text_positions:
+                    break
+                if index + 1 == c.text_positions // 2:
+                    break
+                tokens[finished] = self.eot
+                sampled = step(tokens, len(prefix) + index, first=False, select=True)
+            return _rank(
+                [Candidate(path, float(score)) for path, score in zip(paths, scores, strict=True)]
+            ), no_speech_prob
+        finally:
+            _release_tensors(cache)
 
     def decode_short(
         self, encoder: _EncodedAudio, prompt: list[int], settings: DecodingSettings
@@ -1445,7 +1622,7 @@ def _transcribe_long_fp32(
     samples = np.asarray(audio, dtype=np.float32)
     if samples.ndim != 1 or not np.isfinite(samples).all():
         raise ValueError("audio must be a finite mono waveform")
-    with TensorRTWhisper(checkpoint_dir, precision="fp32") as model:
+    with TensorRTWhisper(checkpoint_dir, precision="fp32", settings=settings) as model:
         mel = model._mel_spectrogram_long(samples)
         timestamp_begin = model.tokenizer.token_to_id("<|0.00|>")
         if timestamp_begin is None:
@@ -1477,6 +1654,6 @@ def _transcribe(
     samples = np.asarray(audio, dtype=np.float32)
     if samples.ndim != 1 or samples.size > 480_000 or not np.isfinite(samples).all():
         raise ValueError("audio must be a finite mono waveform of at most 30 seconds")
-    with TensorRTWhisper(checkpoint_dir, precision=precision) as model:
+    with TensorRTWhisper(checkpoint_dir, precision=precision, settings=settings) as model:
         mel = model._mel_spectrogram(samples)
         return model.decode_short(model.encode(mel), model.prompt_tokens(initial_prompt), settings)

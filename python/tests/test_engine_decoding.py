@@ -56,6 +56,7 @@ def runtime(monkeypatch):
         starts=(1,),
         by_temperature=False,
         detected_languages=("en",),
+        language_scores=None,
         prefixes=None,
         first_probabilities=None,
     ):
@@ -116,8 +117,14 @@ def runtime(monkeypatch):
                     prefixes.append(prefix.copy())
                 if prefix == [5]:
                     output = np.full((1, len(vocab)), -np.inf, dtype=np.float32)
-                    index = min(int(encoder[0]), len(detected_languages) - 1)
-                    output[0, vocab[f"<|{detected_languages[index]}|>"]] = 1
+                    scores = (
+                        [{language: 1} for language in detected_languages]
+                        if language_scores is None
+                        else language_scores
+                    )
+                    index = min(int(encoder[0]), len(scores) - 1)
+                    for language, score in scores[index].items():
+                        output[0, vocab[f"<|{language}|>"]] = score
                     output[0, vocab["<|xyz|>"]] = 10
                     return output
                 task = len(prefix) - 1 - prefix[::-1].index(7)
@@ -163,20 +170,48 @@ def runtime(monkeypatch):
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.req("SP-LFFASTESTWHISPER-042")
 @pytest.mark.parametrize("language", ["en", "ja", "zh", "yue", "ko", "ru", "ar", "hi", "th"])
 @pytest.mark.parametrize("seconds", [1, 31])
+@pytest.mark.parametrize("as_list", [False, True], ids=["code", "singleton-list"])
 def test_explicit_language_is_used_in_short_and_long_decoder_prompts(
-    tmp_path, runtime, language, seconds
+    tmp_path, runtime, language, seconds, as_list
 ):
-    """Explicit language controls every decoder prompt without running language detection."""
+    """One code, as a string or singleton list, controls each prompt without language detection."""
     prefixes = []
     runtime(prefixes=prefixes)
-    engine = _engine(tmp_path, language=language, temperature=0.0)
+    engine = _engine(tmp_path, language=[language] if as_list else language, temperature=0.0)
     with asyncio.Runner() as runner:
         assert _texts(runner, engine, seconds=seconds) == ["A C"] * (2 if seconds > 30 else 1)
         expected = engine._model.tokenizer.token_to_id(f"<|{language}|>")
         assert prefixes and all(prefix != [5] for prefix in prefixes)
         assert {prefix[prefix.index(5) + 1] for prefix in prefixes} == {expected}
+        runner.run(engine.aclose())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.req("SP-LFFASTESTWHISPER-041")
+@pytest.mark.parametrize("precision", ["fp32", "fp16", "fp8"])
+@pytest.mark.parametrize(("seconds", "utterances"), [(1, 2), (31, 1)])
+def test_language_list_restricts_detection_for_each_utterance_and_long_audio_window(
+    tmp_path, runtime, precision, seconds, utterances
+):
+    """Each utterance or long-audio window selects its best listed language, excluding Chinese."""
+    prefixes = []
+    runtime(
+        language_scores=({"zh": 3, "ja": 2, "en": 1}, {"zh": 3, "ja": 1, "en": 2}),
+        prefixes=prefixes,
+    )
+    engine = _engine(tmp_path, precision=precision, language=["en", "ja"], temperature=0.0)
+    with asyncio.Runner() as runner:
+        assert _texts(runner, engine, seconds=seconds, utterances=utterances) == ["A C", "A C"]
+        assert prefixes.count([5]) == 2
+        prompts = [prefix for prefix in prefixes if prefix != [5]]
+        languages = [prefix[prefix.index(5) + 1] for prefix in prompts]
+        ja = engine._model.tokenizer.token_to_id("<|ja|>")
+        en = engine._model.tokenizer.token_to_id("<|en|>")
+        assert languages[0] == ja and languages[-1] == en
+        assert set(languages) == {ja, en}
         runner.run(engine.aclose())
 
 

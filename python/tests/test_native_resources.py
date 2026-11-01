@@ -11,6 +11,7 @@ from tensoracle import EngineHandle
 from tokenizers import Tokenizer, models
 
 from listenflow.fastest_whisper import _engines
+from listenflow.fastest_whisper._decoding import decoding_settings
 from listenflow.fastest_whisper._inference import TensorRTWhisper, _HostIO
 
 
@@ -112,6 +113,51 @@ def _checkpoint(tmp_path):
     )
     tokenizer.save(str(tmp_path / "tokenizer.json"))
     return tmp_path
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-010")
+@pytest.mark.parametrize(
+    ("temperature", "best_of", "extra"),
+    [(0.0, 5, False), ((0.0, 0.4), 2, True), (0.4, 1, False)],
+)
+def test_only_selected_sampled_batches_allocate_an_extra_engine_during_preparation(
+    tmp_path, native, temperature, best_of, extra
+):
+    """Greedy-only preparation keeps its three engines; sampled batches prepare one extra engine."""
+    _, streams, destroyed, contexts, engines, runtimes, _ = native
+    settings = decoding_settings(temperature=temperature, best_of=best_of)
+    model = TensorRTWhisper(_checkpoint(tmp_path), settings=settings)
+    assert len(engines) == len(streams) == 3 + int(extra)
+    assert (model._sampled_decoder is not None) is extra
+    model.close()
+    model.close()
+    assert not streams
+    assert len(destroyed) == 3 + int(extra)
+    assert all(reference() is None for reference in contexts + engines + runtimes)
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-010")
+@pytest.mark.parametrize("temperature", [0.0, (0.0, 0.4)])
+def test_product_preparation_supplies_its_selected_sampling_configuration(
+    tmp_path, native, temperature
+):
+    """The product prepares a candidate batch only when its caller selected a positive temperature."""
+    from listenflow import OfflineModelDirectorySource
+    from listenflow.fastest_whisper import FastestWhisperEngine
+
+    engine = FastestWhisperEngine(
+        model_source=OfflineModelDirectorySource(str(_checkpoint(tmp_path))),
+        precision="fp32",
+        device=0,
+        language="en",
+        temperature=temperature,
+        best_of=2,
+    )
+    model = engine._load_model()
+    try:
+        assert (model._sampled_decoder is not None) is (temperature != 0.0)
+    finally:
+        model.close()
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-005")

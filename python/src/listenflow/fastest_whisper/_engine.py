@@ -109,7 +109,7 @@ class FastestWhisperEngine(STTEngineBase):
         model_source: OfflineModelDirectorySource,
         precision: Precision,
         device: int,
-        language: str | None,
+        language: str | list[str] | None,
         initial_prompt: str | None = None,
         beam_size: int = DecodingSettings.beam_size,
         temperature: float | Sequence[float] = DecodingSettings.temperatures,
@@ -131,10 +131,18 @@ class FastestWhisperEngine(STTEngineBase):
         if device < 0:
             raise ConfigurationError("device must be a non-negative integer")
         if language is not None:
-            if not isinstance(language, str):
-                raise ConfigurationError("language must be a large-v3 language code or None")
-            if language not in LANGUAGES:
-                raise UnsupportedLanguageError(language)
+            if not isinstance(language, (str, list)):
+                raise ConfigurationError(
+                    "language must be a large-v3 language code, a list of codes, or None"
+                )
+            codes = language if isinstance(language, list) else [language]
+            if not codes:
+                raise ConfigurationError("language list must not be empty")
+            for code in codes:
+                if not isinstance(code, str):
+                    raise ConfigurationError("language codes must be strings")
+                if code not in LANGUAGES:
+                    raise UnsupportedLanguageError(code)
         if initial_prompt is not None:
             if not isinstance(initial_prompt, str):
                 raise ConfigurationError("initial_prompt must be None or a non-empty string")
@@ -169,7 +177,7 @@ class FastestWhisperEngine(STTEngineBase):
         self.model_source = model_source
         self.precision = precision
         self.device = device
-        self.language = language
+        self.language = language.copy() if isinstance(language, list) else language
         self.initial_prompt = initial_prompt
         self.boundary_settings = boundary_settings
         self.input_format = input_format
@@ -259,6 +267,7 @@ class FastestWhisperEngine(STTEngineBase):
             Path(self.model_source.directory_path),
             precision=self.precision,
             device=self.device,
+            settings=self._decoding_settings,
         )
 
     async def _recognize(

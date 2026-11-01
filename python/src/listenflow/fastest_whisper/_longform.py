@@ -64,10 +64,10 @@ def decoder_prefix(
     return [previous_token] + prompt[-(text_positions // 2 - 1) :] + list(initial_tokens)
 
 
-def apply_timestamp_rules(
+def apply_timestamp_constraints(
     logits: np.ndarray, sampled: list[int], *, timestamp_begin: int, eot: int
 ) -> np.ndarray:
-    """Mask logits using the official timestamp pair and ordering constraints."""
+    """Mask tokens using the timestamp pair, ordering and initial-position constraints."""
     last_is_timestamp = bool(sampled and sampled[-1] >= timestamp_begin)
     previous_is_timestamp = len(sampled) < 2 or sampled[-2] >= timestamp_begin
     if last_is_timestamp:
@@ -84,6 +84,14 @@ def apply_timestamp_rules(
     if not sampled:
         logits[:timestamp_begin] = -np.inf
         logits[timestamp_begin + 51 :] = -np.inf
+    return logits
+
+
+def apply_timestamp_rules(
+    logits: np.ndarray, sampled: list[int], *, timestamp_begin: int, eot: int
+) -> np.ndarray:
+    """Apply timestamp constraints and prefer timestamps when their total mass wins."""
+    apply_timestamp_constraints(logits, sampled, timestamp_begin=timestamp_begin, eot=eot)
 
     timestamp_mass = np.logaddexp.reduce(logits[timestamp_begin:])
     if timestamp_mass > np.max(logits[:timestamp_begin]):

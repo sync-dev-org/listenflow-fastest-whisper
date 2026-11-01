@@ -72,6 +72,18 @@ class _Graph:
             return self.gelu(self.linear(x, key))
         weight = self.constant(self.weight(f"{key}.weight"))
         bias = self.constant(self.weight(f"{key}.bias"))
+        if x.shape[0] > 1:
+            rows = []
+            for index in range(x.shape[0]):
+                row = self.net.add_slice(
+                    x, (index, 0, 0), (1, 1, x.shape[2]), (1, 1, 1)
+                ).get_output(0)
+                layer = self.net.add_plugin_v3([row, weight, bias], [], _fc1_plugin())
+                if layer is None:
+                    raise RuntimeError("TensorRT rejected the required fp16 fc1 layer")
+                layer.name = f"{key}.gelu.{index}"
+                rows.append(layer.get_output(0))
+            return self.concatenate(rows, 0)
         layer = self.net.add_plugin_v3([x, weight, bias], [], _fc1_plugin())
         if layer is None:
             raise RuntimeError("TensorRT rejected the required fp16 fc1 layer")
@@ -195,6 +207,91 @@ class _Graph:
             silence = self.net.add_gather(distribution.get_output(0), indices, 2).get_output(0)
         return self.concatenate([token, logprob, silence], 2)
 
+    def _sampling_result(
+        self, logits, suppression, temperature, uniform, timestamps, *, timestamp_begin, no_speech
+    ):
+        """Inverse-CDF sampling and unscaled scoring, with only one uniform per candidate."""
+        net = self.net
+        batch, _, vocab = logits.shape
+
+        def integer(value):
+            array = np.asarray(value, dtype=np.int32)
+            self._weights.append(array)
+            return net.add_constant(array.shape, array).get_output(0)
+
+        def reduce(value, operation):
+            return net.add_reduce(value, operation, 1 << 2, True).get_output(0)
+
+        def elementwise(left, right, operation):
+            return net.add_elementwise(left, right, operation).get_output(0)
+
+        def unary(value, operation):
+            return net.add_unary(value, operation).get_output(0)
+
+        scores = self.add(self.single(logits), suppression)
+        if timestamp_begin is not None:
+            # Compare total timestamp mass to the largest text probability in a
+            # shared, stable scale. This is the existing log-sum-exp comparison.
+            centered = elementwise(
+                scores, reduce(scores, trt.ReduceOperation.MAX), trt.ElementWiseOperation.SUB
+            )
+            weights = unary(centered, trt.UnaryOperation.EXP)
+            is_timestamp = integer((np.arange(vocab) >= timestamp_begin)[None, None])
+            is_timestamp = net.add_cast(is_timestamp, trt.bool).get_output(0)
+            zero = self.constant(np.zeros((1, 1, 1), np.float32), fp32=True)
+            timestamp_weights = net.add_select(is_timestamp, weights, zero).get_output(0)
+            text_weights = net.add_select(is_timestamp, zero, weights).get_output(0)
+            wins = elementwise(
+                reduce(timestamp_weights, trt.ReduceOperation.SUM),
+                reduce(text_weights, trt.ReduceOperation.MAX),
+                trt.ElementWiseOperation.GREATER,
+            )
+            wins = elementwise(wins, timestamps, trt.ElementWiseOperation.AND)
+            text_only = net.add_select(
+                is_timestamp,
+                scores,
+                self.constant(np.full((1, 1, 1), -np.inf, np.float32), fp32=True),
+            ).get_output(0)
+            scores = net.add_select(wins, text_only, scores).get_output(0)
+
+        centered = elementwise(
+            scores, reduce(scores, trt.ReduceOperation.MAX), trt.ElementWiseOperation.SUB
+        )
+        scaled = elementwise(centered, temperature, trt.ElementWiseOperation.DIV)
+        weights = unary(scaled, trt.UnaryOperation.EXP)
+        cumulative = net.add_cumulative(
+            weights, integer(2), trt.CumulativeOperation.SUM, False, False
+        ).get_output(0)
+        # Use the very same accumulation for the normalizer and the CDF so the
+        # final positive token always exceeds any uniform in [0, 1).
+        total = net.add_slice(cumulative, (0, 0, vocab - 1), (batch, 1, 1), (1, 1, 1)).get_output(0)
+        eligible = elementwise(
+            cumulative, self.multiply(uniform, total), trt.ElementWiseOperation.GREATER
+        )
+        indices = integer(np.arange(vocab)[None, None])
+        sentinel = integer(np.full((1, 1, 1), vocab - 1))
+        token = reduce(
+            net.add_select(eligible, indices, sentinel).get_output(0), trt.ReduceOperation.MIN
+        )
+        gathered = net.add_gather_v2(centered, token, trt.GatherMode.ELEMENT)
+        gathered.axis = 2
+        normalizer = unary(
+            reduce(unary(centered, trt.UnaryOperation.EXP), trt.ReduceOperation.SUM),
+            trt.UnaryOperation.LOG,
+        )
+        logprob = elementwise(gathered.get_output(0), normalizer, trt.ElementWiseOperation.SUB)
+        if no_speech is None:
+            silence = self.constant(np.full((batch, 1, 1), np.nan, np.float32), fp32=True)
+        else:
+            distribution = net.add_softmax(self.single(logits))
+            distribution.axes = 1 << 2
+            silence = net.add_gather(
+                distribution.get_output(0), integer([no_speech]), 2
+            ).get_output(0)
+        return self.concatenate(
+            [net.add_cast(token, trt.float32).get_output(0), logprob, silence], 2
+        )
+
     def block(
         self,
         x: trt.ITensor,
@@ -255,20 +352,21 @@ class _Graph:
         self.stack_layers(keys, "cross_keys")
         self.stack_layers(values, "cross_values")
 
-    def decoder(self) -> None:
+    def decoder(self, *, sample_batch: int | None = None) -> None:
         c = self.config
-        tokens = self.net.add_input("tokens", trt.int32, (1, 1))
-        positions = self.net.add_input("positions", trt.int32, (1, 1))
+        batch = 1 if sample_batch is None else sample_batch
+        tokens = self.net.add_input("tokens", trt.int32, (batch, 1))
+        positions = self.net.add_input("positions", trt.int32, (batch, 1))
         mask = self.net.add_input("mask", trt.float32, (1, 1, 1, -1))
         dtype = trt.float16 if self.precision == "fp16" else trt.float32
         head_dim = c.audio_state // c.text_heads
-        self_shape = (c.text_layers, 1, c.text_heads, -1, head_dim)
+        self_shape = (c.text_layers, batch, c.text_heads, -1, head_dim)
         cross_shape = (c.text_layers, 1, c.text_heads, c.audio_positions, head_dim)
         self_keys = self.net.add_input("self_keys", dtype, self_shape)
         self_values = self.net.add_input("self_values", dtype, self_shape)
         cross_keys = self.net.add_input("cross_keys", dtype, cross_shape)
         cross_values = self.net.add_input("cross_values", dtype, cross_shape)
-        suppression = self.net.add_input("suppression", trt.float32, (1, 1, c.vocab_size))
+        suppression = self.net.add_input("suppression", trt.float32, (batch, 1, c.vocab_size))
         token_table = self.constant(self.weight("model.decoder.embed_tokens.weight"))
         position_table = self.constant(self.weight("model.decoder.embed_positions.weight"))
         x = self.add(
@@ -310,14 +408,29 @@ class _Graph:
         ).get_output(0)
         logits.name = "logits"
         self.net.mark_output(logits)
-        token = self._select_token(logits, suppression)
-        token.name = "token"
-        self.net.mark_output(token)
         tokenizer = Tokenizer.from_file(str(self.checkpoint.directory / "tokenizer.json"))
-        result = self._greedy_result(
-            logits, suppression, token=token, no_speech=tokenizer.token_to_id("<|nospeech|>")
-        )
-        result.name = "greedy"
+        if sample_batch is None:
+            token = self._select_token(logits, suppression)
+            token.name = "token"
+            self.net.mark_output(token)
+            result = self._greedy_result(
+                logits, suppression, token=token, no_speech=tokenizer.token_to_id("<|nospeech|>")
+            )
+            result.name = "greedy"
+        else:
+            temperature = self.net.add_input("temperature", trt.float32, (1, 1, 1))
+            uniform = self.net.add_input("uniform", trt.float32, (batch, 1, 1))
+            timestamps = self.net.add_input("timestamps", trt.bool, (1, 1, 1))
+            result = self._sampling_result(
+                logits,
+                suppression,
+                temperature,
+                uniform,
+                timestamps,
+                timestamp_begin=tokenizer.token_to_id("<|0.00|>"),
+                no_speech=tokenizer.token_to_id("<|nospeech|>"),
+            )
+            result.name = "sampled"
         self.net.mark_output(result)
         self.stack_layers(present_keys, "present_keys")
         self.stack_layers(present_values, "present_values")

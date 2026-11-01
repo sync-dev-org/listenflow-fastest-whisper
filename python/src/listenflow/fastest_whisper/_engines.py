@@ -23,6 +23,7 @@ from ._precision import PRECISIONS
 
 # Increase the relevant value when a graph change makes an older serialized engine incompatible.
 _GRAPH_VERSION = {"mel": "2", "encoder": "3", "decoder": "5"}
+_SAMPLED_DECODER_VERSION = "1"
 _SETTINGS = BuilderSettings(workspace_limit=4 * 1024**3, optimization_level=5, tf32=False)
 
 
@@ -90,6 +91,7 @@ def open_whisper_engine(
     precision: str,
     force_rebuild: bool = False,
     logger: trt.ILogger,
+    sample_batch: int | None = None,
 ) -> EngineHandle:
     """Open one graph with the same identity and build settings on both inference paths."""
     c = checkpoint.config
@@ -134,6 +136,44 @@ def open_whisper_engine(
                 "present_values": TensorSpec(output_dtype, self_shape),
             },
         )
+        if sample_batch is not None:
+            batch = sample_batch
+            self_shape = (c.text_layers, batch, c.text_heads, -1, head_dim)
+            self_range = InputShape.ranged(
+                (c.text_layers, batch, c.text_heads, 1, head_dim),
+                (c.text_layers, batch, c.text_heads, 64, head_dim),
+                (c.text_layers, batch, c.text_heads, positions, head_dim),
+            )
+            inputs = {
+                **inputs,
+                "tokens": InputShape.fixed((batch, 1)),
+                "positions": InputShape.fixed((batch, 1)),
+                "self_keys": self_range,
+                "self_values": self_range,
+                "suppression": InputShape.fixed((batch, 1, c.vocab_size)),
+                "temperature": InputShape.fixed((1, 1, 1)),
+                "uniform": InputShape.fixed((batch, 1, 1)),
+                "timestamps": InputShape.fixed((1, 1, 1)),
+            }
+            io = EngineIO(
+                inputs={
+                    **io.inputs,
+                    "tokens": TensorSpec(trt.int32, (batch, 1)),
+                    "positions": TensorSpec(trt.int32, (batch, 1)),
+                    "self_keys": TensorSpec(output_dtype, self_shape),
+                    "self_values": TensorSpec(output_dtype, self_shape),
+                    "suppression": TensorSpec(trt.float32, (batch, 1, c.vocab_size)),
+                    "temperature": TensorSpec(trt.float32, (1, 1, 1)),
+                    "uniform": TensorSpec(trt.float32, (batch, 1, 1)),
+                    "timestamps": TensorSpec(trt.bool, (1, 1, 1)),
+                },
+                outputs={
+                    "logits": TensorSpec(output_dtype, (batch, 1, c.vocab_size)),
+                    "sampled": TensorSpec(trt.float32, (batch, 1, 3)),
+                    "present_keys": TensorSpec(output_dtype, self_shape),
+                    "present_values": TensorSpec(output_dtype, self_shape),
+                },
+            )
     else:
         shape = (1, c.n_mels, c.audio_positions * 2)
         inputs = {"mel": InputShape.fixed(shape)}
@@ -168,6 +208,8 @@ def open_whisper_engine(
             raise ValueError("FP8 scales must map linear input names to scalar values")
         weight_files.append(_fp8._SCALES)
         graph_version = f"{_GRAPH_VERSION[name]}-{_fp8._GRAPH_VERSION}"
+    if sample_batch is not None:
+        graph_version = f"{graph_version}-sampled-{_SAMPLED_DECODER_VERSION}-b{sample_batch}"
     plugins = (_fc1_library(),) if decoder and precision == "fp16" else ()
 
     def define_graph(network: trt.INetworkDefinition) -> None:
@@ -179,7 +221,10 @@ def open_whisper_engine(
             graph = _Fp8Graph(network, checkpoint, scales)
         graph_owners.append(graph)
         if decoder:
-            graph.decoder()
+            if sample_batch is None:
+                graph.decoder()
+            else:
+                graph.decoder(sample_batch=sample_batch)
         else:
             graph.encoder()
 
@@ -187,7 +232,7 @@ def open_whisper_engine(
     handle = _open_cached_engine(
         define_graph,
         EngineBuild(inputs=inputs, settings=_SETTINGS),
-        name=f"listenflow-fastest-whisper-{name}",
+        name=f"listenflow-fastest-whisper-{'sampled-decoder' if sample_batch else name}",
         graph_version=graph_version,
         weights=weight_files,
         plugins=plugins,

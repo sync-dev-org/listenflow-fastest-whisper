@@ -224,7 +224,7 @@ def cpu_tensor_rt(tmp_path, monkeypatch):
         def close(self):
             observed.closed_engines.append("decoder")
 
-    def initialize(model, checkpoint_dir, *, precision="fp32", device=0):
+    def initialize(model, checkpoint_dir, *, precision="fp32", device=0, settings=None):
         model.checkpoint_dir = Path(checkpoint_dir)
         model.precision = precision
         model.device = device

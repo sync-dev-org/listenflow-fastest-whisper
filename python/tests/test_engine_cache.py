@@ -95,7 +95,7 @@ def test_encoder_and_decoder_keep_cache_identity_without_caller_rebuild(tmp_path
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-008")
-@pytest.mark.parametrize("graph", ["mel", "encoder", "decoder"])
+@pytest.mark.parametrize("graph", ["mel", "encoder", "decoder", "sampled_decoder"])
 @pytest.mark.parametrize("error_type", [CorruptEngineError, EngineConditionError, EngineIOError])
 def test_unusable_saved_graph_is_rebuilt_once(tmp_path, monkeypatch, graph, error_type):
     """Each damaged or incompatible graph is rebuilt while keeping its cache identity."""
@@ -119,6 +119,8 @@ def test_unusable_saved_graph_is_rebuilt_once(tmp_path, monkeypatch, graph, erro
     model.logger = object()
     if graph == "mel":
         actual = model._open_mel(checkpoint)
+    elif graph == "sampled_decoder":
+        actual = model._open_sampled_engine(checkpoint, batch_size=5)
     else:
         actual = model._open_engine(checkpoint, decoder=graph == "decoder")
 
@@ -130,6 +132,37 @@ def test_unusable_saved_graph_is_rebuilt_once(tmp_path, monkeypatch, graph, erro
     original_args, original_kwargs = calls[0]
     original_kwargs.pop("force_rebuild", False)
     assert (retry_args, retry_kwargs) == (original_args, original_kwargs)
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-008")
+def test_sampled_candidate_batch_never_reuses_the_greedy_or_other_batch_engine(
+    tmp_path, monkeypatch
+):
+    """Sampled decoders separate batch sizes and precisions without invalidating greedy plans."""
+    from listenflow.fastest_whisper import _engines
+
+    monkeypatch.setattr(_engines, "_fc1_library", lambda: tmp_path / "fc1.so")
+    calls = []
+
+    def open_native(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(create_execution=lambda: SimpleNamespace(close=lambda: None))
+
+    monkeypatch.setattr(_engines, "open_engine", open_native)
+    config = ModelConfig(128, 1500, 1280, 20, 5120, 32, 20, 5120, 32, 448, 51866)
+    checkpoint = SimpleNamespace(directory=tmp_path, config=config, weight_map=None)
+    for precision, batch in [("fp32", None), ("fp32", 2), ("fp32", 5), ("fp16", 5)]:
+        _engines.open_whisper_engine(
+            checkpoint, decoder=True, precision=precision, logger=None, sample_batch=batch
+        )
+    assert calls[0][1]["name"] == "listenflow-fastest-whisper-decoder"
+    assert calls[0][1]["graph_version"] == "5-fp32"
+    assert len({(kw["name"], kw["graph_version"]) for _, kw in calls}) == 4
+    for (args, kwargs), batch in zip(calls[1:], (2, 5, 5), strict=True):
+        assert args[1].inputs["tokens"].maximum == (batch, 1)
+        assert args[1].inputs["self_keys"].maximum == (32, batch, 20, 448, 64)
+        assert kwargs["io"].outputs["sampled"].shape == (batch, 1, 3)
+        assert "uniform" in args[1].inputs
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-008")

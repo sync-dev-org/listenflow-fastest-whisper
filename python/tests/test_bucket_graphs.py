@@ -134,6 +134,103 @@ def test_released_outputs_share_one_capture_within_each_length_interval(bucket_n
     assert len(model._decoder._graphs.entries) == 2  # Dummy-only length and the first interval.
 
 
+@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+def test_sampled_length_buckets_share_one_workspace_until_all_captures_close(
+    bucket_native, monkeypatch
+):
+    """Long candidate histories retain one GPU workspace across every captured length interval."""
+    import tensorrt as trt
+    from cuda.bindings import runtime as cudart
+
+    from listenflow.fastest_whisper._inference import _CudaGraphs
+
+    model, _ = bucket_native
+    engine = model._decoder.execution._handle.engine
+    native_create = type(engine).create_execution_context
+    context_type = type(model._decoder.execution._context)
+    created, bound, allocated, freed = [], [], [], []
+    malloc, free = cudart.cudaMalloc, cudart.cudaFree
+    monkeypatch.setattr(type(engine), "device_memory_size_v2", 4096, raising=False)
+
+    def create(self, strategy=trt.ExecutionContextAllocationStrategy.STATIC):
+        created.append(strategy)
+        return native_create(self)
+
+    def allocate(size):
+        result = malloc(size)
+        if size == 4096:
+            allocated.append(result[1])
+        return result
+
+    def release(pointer):
+        freed.append(pointer)
+        return free(pointer)
+
+    monkeypatch.setattr(type(engine), "create_execution_context", create)
+    monkeypatch.setattr(
+        context_type,
+        "set_device_memory",
+        lambda self, ptr, size: bound.append((ptr, size)),
+        raising=False,
+    )
+    monkeypatch.setattr(cudart, "cudaMalloc", allocate)
+    monkeypatch.setattr(cudart, "cudaFree", release)
+    model._decoder._graphs.close()
+    graphs = _CudaGraphs(model._decoder.execution._handle, share_workspace=True)
+    model._decoder._graphs = graphs
+    encoder = model.encode(np.zeros((128, 3000), np.float32))
+    model.logits([1] * 448, encoder)
+    assert len(created) == len(graphs.entries) > 10
+    assert set(created) == {trt.ExecutionContextAllocationStrategy.USER_MANAGED}
+    assert len(allocated) == 1
+    assert set(bound) == {(allocated[0], 4096)}
+    graphs.close()
+    graphs.close()
+    assert freed.count(allocated[0]) == 1
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+def test_failed_sampled_stream_creation_returns_its_prepared_workspace(cpu_native, monkeypatch):
+    """Failed stream initialization releases the workspace even while its exception is retained."""
+    from listenflow.fastest_whisper import _inference
+
+    model, cudart, *_ = cpu_native
+    handle = model._decoder.execution._handle
+    monkeypatch.setattr(type(handle.engine), "device_memory_size_v2", 32, raising=False)
+    initialize = _inference._CudaGraphs.__init__
+    malloc, free = cudart.cudaMalloc, cudart.cudaFree
+    allocated, freed = [], []
+
+    def graphs(self, handle, **_kwargs):
+        initialize(self, handle, share_workspace=True)
+
+    def allocate(size):
+        result = malloc(size)
+        allocated.append(result[1])
+        return result
+
+    def release(pointer):
+        freed.append(pointer)
+        return free(pointer)
+
+    monkeypatch.setattr(_inference._CudaGraphs, "__init__", graphs)
+    monkeypatch.setattr(cudart, "cudaMalloc", allocate)
+    monkeypatch.setattr(cudart, "cudaFree", release)
+    monkeypatch.setattr(
+        cudart, "cudaStreamCreate", lambda: (cudart.cudaError_t.cudaErrorMemoryAllocation, None)
+    )
+    try:
+        with pytest.raises(RuntimeError, match="cudaStreamCreate") as failure:
+            _HostIO(handle)
+        assert failure.value.__traceback__ is not None
+        assert len(allocated) == 1
+        assert freed.count(allocated[0]) == 1
+    finally:
+        for pointer in allocated:
+            if pointer not in freed:
+                free(pointer)
+
+
 def _greedy_history(model, encoder, count):
     prefix = [1]
     model._clear_greedy_cache()

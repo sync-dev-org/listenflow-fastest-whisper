@@ -32,7 +32,6 @@ from listenflow.fastest_whisper import (
     transcribe_fp16,
     transcribe_long_fp32,
 )
-from listenflow.fastest_whisper._engine import _cuda_device_info
 
 FIXTURES = Path(__file__).parent / "fixtures"
 # A fresh TensorRT build takes several minutes on sm86; the limit only stops a hung process.
@@ -384,35 +383,63 @@ def test_auto_detects_and_transcribes_english_and_japanese(gpu, engine_loop):
 
 
 @pytest.mark.gpu
-@pytest.mark.req("SP-LFFASTESTWHISPER-010")
-@pytest.mark.req("SP-LFFASTESTWHISPER-019")
-def test_nonzero_device_is_used_when_visible(gpu, monkeypatch, engine_loop):
-    """The selected nonzero CUDA device builds and transcribes when present."""
-    count, _ = _cuda_device_info(1)
-    if count < 2:
-        pytest.skip("this host exposes only one CUDA device")
-    from cuda.bindings import runtime as cudart
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.req("SP-LFFASTESTWHISPER-041")
+@pytest.mark.req("SP-LFFASTESTWHISPER-042")
+def test_language_list_transcribes_english_and_japanese_and_restricts_korean(gpu, engine_loop):
+    """A Japanese/English list preserves both languages and excludes Korean on Korean speech."""
+    selected = _engine(gpu, language=["ja", "en"], temperature=0.0)
+    fixtures = (
+        ("en", "small_boat_16khz_mono_s16le.wav"),
+        ("ja", "ja_pronunciation_practice5_25s_16khz_mono_s16le.wav"),
+    )
+    actual_texts = {}
+    try:
+        for language, fixture in fixtures:
+            actual_texts[language] = [
+                event.text
+                for event in _events(engine_loop, selected, _pcm(fixture))
+                if isinstance(event, Final)
+            ]
+            expected_token = selected._model.tokenizer.token_to_id(f"<|{language}|>")
+            assert selected._model.initial_tokens[1] == expected_token
+    finally:
+        engine_loop.run(selected.aclose())
+    for language, fixture in fixtures:
+        pcm = _pcm(fixture)
+        fixed = _engine(gpu, language=language, temperature=0.0)
+        try:
+            expected = [
+                event.text for event in _events(engine_loop, fixed, pcm) if isinstance(event, Final)
+            ]
+            assert actual_texts[language] == expected
+            assert actual_texts[language]
+        finally:
+            engine_loop.run(fixed.aclose())
 
-    selected_devices = []
-    set_device = cudart.cudaSetDevice
-
-    def observe_device(device):
-        result = set_device(device)
-        assert result[0] == cudart.cudaError_t.cudaSuccess
-        status, selected = cudart.cudaGetDevice()
-        assert status == cudart.cudaError_t.cudaSuccess
-        selected_devices.append(selected)
-        return result
-
-    monkeypatch.setattr(cudart, "cudaSetDevice", observe_device)
-    engine = _engine(gpu, device=1)
-    assert [
-        event
-        for event in _events(engine_loop, engine, _pcm("small_boat_16khz_mono_s16le.wav"))
-        if isinstance(event, Final)
-    ]
-    assert len(selected_devices) >= 4
-    assert set(selected_devices) == {1}
+    korean_pcm = _pcm("fleurs_ko_1929_16khz_mono_s16le.wav")
+    automatic = _engine(gpu, language=None, temperature=0.0)
+    try:
+        _events(engine_loop, automatic, korean_pcm)
+        assert automatic._model.initial_tokens[1] == automatic._model.tokenizer.token_to_id(
+            "<|ko|>"
+        )
+    finally:
+        engine_loop.run(automatic.aclose())
+    selected = _engine(gpu, language=["ja", "en"], temperature=0.0)
+    try:
+        actual = [
+            event.text
+            for event in _events(engine_loop, selected, korean_pcm)
+            if isinstance(event, Final)
+        ]
+        assert selected._model.initial_tokens[1] in {
+            selected._model.tokenizer.token_to_id("<|ja|>"),
+            selected._model.tokenizer.token_to_id("<|en|>"),
+        }
+        assert actual
+    finally:
+        engine_loop.run(selected.aclose())
 
 
 @pytest.mark.gpu

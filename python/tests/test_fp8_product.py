@@ -80,3 +80,19 @@ def test_packaged_scales_cover_every_large_v3_linear_input():
     }
     assert scales.keys() == expected
     assert all(math.isfinite(value) and value > 0 for value in scales.values())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-003")
+@pytest.mark.req("SP-LFFASTESTWHISPER-040")
+def test_packaged_scales_cover_observed_multilingual_validation_inputs():
+    """The shipped scales retain the largest Hindi, Thai and encoder validation inputs."""
+    artifact = files("listenflow.fastest_whisper").joinpath("assets/fp8-scales.json")
+    scales = json.loads(artifact.read_text())
+    # Observed official-fp32 maxima from the nine-language validation calibration.
+    maxima = {
+        "model.decoder.layers.18.encoder_attn.out_proj": 22.02214813232422,
+        "model.decoder.layers.2.fc2": 12.829965591430664,
+        "model.encoder.layers.14.self_attn.out_proj": 1.898099422454834,
+    }
+    for layer, maximum in maxima.items():
+        assert scales[layer] == pytest.approx(maximum / 448, rel=1e-12)

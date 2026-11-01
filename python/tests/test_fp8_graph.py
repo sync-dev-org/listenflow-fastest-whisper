@@ -238,6 +238,28 @@ def test_product_graphs_keep_original_dtypes_and_fc1_without_any_quantization(
     assert net.outputs["cross_keys" if part == "encoder" else "logits"].dtype == expected
 
 
+@pytest.mark.req("SP-LFFASTESTWHISPER-003")
+def test_sampled_fp16_batch_uses_existing_single_row_fc1_with_shared_weights(tmp_path, monkeypatch):
+    """Each candidate uses the same existing fc1 kernel and shares one set of layer weights."""
+    monkeypatch.setattr("listenflow.fastest_whisper._network._fc1_plugin", lambda: object())
+
+    class NativeNetwork(Network):
+        def add_slice(self, x, start, shape, stride):
+            return self.layer("slice", [x], shape)
+
+        def add_plugin_v3(self, tensors, shape_inputs, plugin):
+            assert tensors[0].shape == (1, 1, 4), "existing fc1 accepts one candidate per call"
+            return super().add_plugin_v3(tensors, shape_inputs, plugin)
+
+    net = NativeNetwork()
+    graph = _Graph(net, checkpoint(tmp_path), "fp16")
+    graph.decoder_fc1(Tensor((5, 1, 4), trt.float16), "model.decoder.layers.0.fc1")
+    calls = [layer for layer in net.layers if layer.kind == "plugin"]
+    assert len(calls) == 5
+    assert all(layer.inputs[1] is calls[0].inputs[1] for layer in calls)
+    assert all(layer.inputs[2] is calls[0].inputs[2] for layer in calls)
+
+
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
 def test_fp8_scales_separate_cache_identity_and_do_not_load_fp16_fc1(tmp_path, monkeypatch):
     """A changed calibration file invalidates only the trial engines and never binds fc1."""

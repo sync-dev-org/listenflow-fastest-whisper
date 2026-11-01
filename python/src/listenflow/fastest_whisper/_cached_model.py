@@ -15,6 +15,15 @@ from ._longform import TimedSegment, transcribe_mel
 
 
 class CachedWhisper(TensorRTWhisper):
+    def _open_sampled_engine(self, checkpoint: Checkpoint, *, batch_size: int):
+        return open_whisper_engine(
+            checkpoint,
+            decoder=True,
+            precision=self.precision,
+            logger=self.logger,
+            sample_batch=batch_size,
+        )
+
     def _open_engine(self, checkpoint: Checkpoint, *, decoder: bool):
         return open_whisper_engine(
             checkpoint,
@@ -38,7 +47,7 @@ class CachedWhisper(TensorRTWhisper):
         self,
         audio: np.ndarray,
         *,
-        language: str | None = "en",
+        language: str | list[str] | None = "en",
         initial_prompt: str | None = None,
         beam_size: int = DecodingSettings.beam_size,
         temperature: float | Sequence[float] = DecodingSettings.temperatures,
@@ -56,10 +65,14 @@ class CachedWhisper(TensorRTWhisper):
             no_speech_threshold=no_speech_threshold,
         )
         prompt_tokens = self.prompt_tokens(initial_prompt)
+        if isinstance(language, list) and len(language) == 1:
+            language = language[0]
         if audio.size <= N_SAMPLES:
             mel = self._mel_spectrogram(audio)
             encoder = self.encode(mel)
-            self._set_language(language if language is not None else self._detect_language(encoder))
+            self._set_language(
+                language if isinstance(language, str) else self._detect_language(encoder, language)
+            )
             result = self.decode_short(encoder, prompt_tokens, settings)
             return [TimedSegment(0.0, audio.size / 16_000, result.text)] if result.text else []
 
@@ -70,7 +83,9 @@ class CachedWhisper(TensorRTWhisper):
 
         def decode(window, prompt):
             encoder = self.encode(window)
-            self._set_language(language if language is not None else self._detect_language(encoder))
+            self._set_language(
+                language if isinstance(language, str) else self._detect_language(encoder, language)
+            )
             return self.decode_long(encoder, prompt, settings)
 
         result = transcribe_mel(

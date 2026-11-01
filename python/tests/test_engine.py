@@ -197,7 +197,7 @@ def test_capabilities_match_accepted_languages_and_are_static(tmp_path):
     assert english.capabilities.auto_language is automatic.capabilities.auto_language is True
     for language in english.capabilities.languages:
         assert _engine(tmp_path, language=language).language == language
-    for language in ("zz", "English", "en-US", "EN", "en_us", "eng", "", 7, b"en", []):
+    for language in ("zz", "English", "en-US", "EN", "en_us", "eng", "", 7, b"en"):
         with pytest.raises(ConfigurationError, match="language"):
             _engine(tmp_path, language=language)
     assert automatic.capabilities.input_format is EngineInputFormat.PCM_F32
@@ -206,6 +206,25 @@ def test_capabilities_match_accepted_languages_and_are_static(tmp_path):
         "local_vad",
         "client_flush",
     }
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-039")
+@pytest.mark.req("SP-LFFASTESTWHISPER-042")
+def test_language_list_keeps_all_languages_and_automatic_detection_in_capabilities(tmp_path):
+    """Restricting detection still advertises every supported language and automatic detection."""
+    from listenflow.fastest_whisper._languages import LANGUAGES
+
+    engine = _engine(tmp_path, language=["ja", "en"])
+    assert engine.capabilities.languages == LANGUAGES
+    assert engine.capabilities.auto_language is True
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-042")
+@pytest.mark.parametrize("language", [[], [7], ["ja", None], ["en", b"ja"], ["ja", ["en"]]])
+def test_empty_language_lists_and_nontext_items_fail_before_preparation(tmp_path, language):
+    """Empty lists and lists containing values other than codes fail during construction."""
+    with pytest.raises(ConfigurationError, match="language"):
+        _engine(tmp_path, language=language)
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-019")
@@ -404,12 +423,13 @@ def test_stream_passes_language_selection_to_the_window_decoder(tmp_path, native
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-039")
 @pytest.mark.parametrize("language", ["zz", "cmn_hans_cn", "en-US"])
-def test_unknown_language_raises_the_exported_configuration_error(tmp_path, language):
+@pytest.mark.parametrize("as_list", [False, True], ids=["code", "list"])
+def test_unknown_language_raises_the_exported_configuration_error(tmp_path, language, as_list):
     """Unknown language codes fail at construction through the exported configuration subtype."""
     from listenflow.fastest_whisper import UnsupportedLanguageError
 
     with pytest.raises(ConfigurationError, match="language") as failure:
-        _engine(tmp_path, language=language)
+        _engine(tmp_path, language=["ja", language] if as_list else language)
     assert isinstance(failure.value, UnsupportedLanguageError)
     assert failure.value.language == language
 
