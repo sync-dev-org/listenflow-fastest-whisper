@@ -13,7 +13,7 @@ from listenflow.fastest_whisper._cached_model import CachedWhisper
 from test_engine_gpu import (
     _engine,
     _engine_files,
-    _engine_hash,
+    _engine_identity,
     _events,
     _pcm,
 )
@@ -96,10 +96,10 @@ def test_fp8_saved_engines_reuse_and_rebuild_for_changed_scales_and_graph(
     recognize()
     assert len(builds) == 3
     files = _engine_files(tmp_path / "engine-cache")
-    before = {path: (path.stat().st_mtime_ns, _engine_hash(path)) for path in files}
+    before = {path: _engine_identity(path) for path in files}
     recognize()
     assert len(builds) == 3
-    assert before == {path: (path.stat().st_mtime_ns, _engine_hash(path)) for path in files}
+    assert before == {path: _engine_identity(path) for path in files}
     scales = json.loads(data.read_text())
     scales[next(iter(scales))] *= 1.0001
     data.write_text(json.dumps(scales))

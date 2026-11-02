@@ -74,13 +74,13 @@ a local large-v3 checkpoint, and the small-boat and silence WAVs. Pass
 `--checkpoint PATH --audio PATH --audio PATH`. Save its JSON output, then start
 a new process with the same cache and `--reuse --expect FIRST_RESULT.json`.
 The probe checks preparation, streaming, fp16 token sequences, unchanged saved
-engine bytes and timestamps, and the absence of producer imports. Compare
+engine inodes and SHA-256 hashes, and the absence of producer imports. Compare
 `observed` with the development build's result as well. A separate CUDA-driver
 observer can verify fc1 launches and the selected SM without changing the plugin.
 
 Retain installed dependency versions, GPU/driver/runtime versions, test commands,
 elapsed times, and disk measurements with the build records. Run the existing
-fc1 correctness and engine-cache recovery GPU tests with tensoracle 1.4.0. Record
+fc1 correctness and engine-cache recovery GPU tests with tensoracle 1.5.0. Record
 sm86 and sm89 as build/inspection coverage when those GPUs are unavailable.
 Check artifact size against the current upload limit before publication. These
 commands build and inspect artifacts; publication is a separate action.

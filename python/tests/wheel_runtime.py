@@ -32,7 +32,7 @@ def saved_engines():
         with path.open("rb") as source:
             digest = hashlib.file_digest(source, "sha256").hexdigest()
         result[path.name] = {
-            "mtime_ns": path.stat().st_mtime_ns,
+            "inode": path.stat().st_ino,
             "sha256": digest,
         }
     return result

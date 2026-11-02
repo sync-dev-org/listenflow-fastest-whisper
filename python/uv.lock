@@ -462,7 +462,7 @@ requires-dist = [
     { name = "listenflow", specifier = ">=0.22.0" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "safetensors", specifier = ">=0.4" },
-    { name = "tensoracle", specifier = ">=1.4.0,<2" },
+    { name = "tensoracle", specifier = ">=1.5.0,<2" },
     { name = "tensorrt-cu13", specifier = ">=11.0" },
     { name = "tokenizers", specifier = ">=0.22" },
 ]
@@ -470,7 +470,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 cubin = [
     { name = "nvidia-cuda-runtime", specifier = "==13.2.86" },
-    { name = "tensoracle", extras = ["producer"], specifier = ">=1.4.0,<2" },
+    { name = "tensoracle", extras = ["producer"], specifier = ">=1.5.0,<2" },
 ]
 dev = [
     { name = "pytest", specifier = ">=8.0" },
@@ -1073,16 +1073,16 @@ wheels = [
 
 [[package]]
 name = "tensoracle"
-version = "1.4.0"
+version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "safetensors" },
     { name = "tensorrt-cu13" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/53/89/a94493c95a32bbaa22bf7425cdad5296294ef5e77584a100567586927035/tensoracle-1.4.0.tar.gz", hash = "sha256:fe5f137438aba1f413f28e42406e208a1da259334289384ac7a9a0026c47cad9", size = 241749, upload-time = "2026-10-27T16:32:17.76Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/de/d6/f1af458b3c55d9ad8de979a8677752cc7cd554349b50d10e02e5e941adf9/tensoracle-1.5.0.tar.gz", hash = "sha256:c4302de79c5b3356d1e844f2d9acf8203b3085298427a1a0f84681fc8e383059", size = 248616, upload-time = "2026-11-02T06:26:46.34Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/45/4b/7f2f22bd8337d570a2e0f76db5f322b0c5999c070600e5c1aa1482486aea/tensoracle-1.4.0-py3-none-any.whl", hash = "sha256:1c13d1a8e1e344430a72d469251afeb5422c299027ea11217c0ba15068552834", size = 49656, upload-time = "2026-10-27T16:32:15.921Z" },
+    { url = "https://files.pythonhosted.org/packages/30/8b/6cc878341068011164cdb679e71ea2457fc71abb00f91838e886fea39ef7/tensoracle-1.5.0-py3-none-any.whl", hash = "sha256:00464d45351e58899273a2129ba88a251233dab88deaff8309b45128f5e8afea", size = 55012, upload-time = "2026-11-02T06:26:44.712Z" },
 ]
 
 [package.optional-dependencies]

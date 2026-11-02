@@ -107,9 +107,9 @@ def _engine_files(cache):
     return sorted((cache / "tensoracle").glob("*.engine"))
 
 
-def _engine_hash(path):
+def _engine_identity(path):
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        return path.stat().st_ino, hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def _damage_saved_plugin(path, damage):
@@ -520,17 +520,17 @@ asyncio.run(run())
             files = _engine_files(cache)
             assert len(files) == 3
             identities.append({path.name for path in files})
-            before = {path.name: (path.stat().st_mtime_ns, _engine_hash(path)) for path in files}
+            before = {path.name: _engine_identity(path) for path in files}
             assert recognize(precision) == expected
-            assert {
-                path.name: (path.stat().st_mtime_ns, _engine_hash(path)) for path in files
-            } == before
+            assert {path.name: _engine_identity(path) for path in files} == before
 
             for damage in ("corrupt", "incompatible", "missing-plugin", "plugin-version"):
                 if precision != "fp16" and damage in ("missing-plugin", "plugin-version"):
                     continue
                 for target in files:
-                    unchanged = {path: path.stat().st_mtime_ns for path in files if path != target}
+                    unchanged = {
+                        path: _engine_identity(path) for path in files if path != target
+                    }
                     if damage == "corrupt":
                         target.write_bytes(b"truncated")
                     elif damage == "incompatible":
@@ -548,14 +548,16 @@ asyncio.run(run())
                             stream.write(encoded)
                     elif not _damage_saved_plugin(target, damage):
                         continue
-                    damaged = _engine_hash(target)
+                    damaged_inode, damaged_hash = _engine_identity(target)
                     unavailable = damage if damage in ("missing-plugin", "plugin-version") else None
                     assert recognize(precision, unavailable) == expected
-                    assert _engine_hash(target) != damaged, (precision, damage, target.name)
-                    assert {path: path.stat().st_mtime_ns for path in unchanged} == unchanged
-                    rebuilt = {path: path.stat().st_mtime_ns for path in files}
+                    rebuilt_inode, rebuilt_hash = _engine_identity(target)
+                    assert rebuilt_inode != damaged_inode, (precision, damage, target.name)
+                    assert rebuilt_hash != damaged_hash, (precision, damage, target.name)
+                    assert {path: _engine_identity(path) for path in unchanged} == unchanged
+                    rebuilt = {path: _engine_identity(path) for path in files}
                     assert recognize(precision) == expected
-                    assert {path: path.stat().st_mtime_ns for path in files} == rebuilt
+                    assert {path: _engine_identity(path) for path in files} == rebuilt
                     print(f"{precision}: {damage}: {target.name}: rebuilt and reused", flush=True)
     assert identities[0].isdisjoint(identities[1])
 
