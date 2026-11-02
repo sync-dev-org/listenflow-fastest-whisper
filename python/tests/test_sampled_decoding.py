@@ -164,3 +164,57 @@ def test_prepared_retry_uses_its_batch_without_building_or_requesting_host_logit
     assert actual.tokens == [1]
     assert actual.text == "1"
     assert actual.avg_logprob == pytest.approx(-0.6 / 2)
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-047")
+def test_sampled_batch_stops_a_phrase_candidate_without_stopping_or_rescoring_other_paths():
+    """A rejected sample freezes at its confirmed phrase while the better sample finishes."""
+    model, encoder, calls = sampled_model(
+        [
+            [(0, -1.0, 0.1), (1, -0.1, 0.1)],
+            [(2, -1.0, 0.1), (1, -0.1, 0.1)],
+            [(0, -99, 0.1), (3, -0.1, 0.1)],
+        ]
+    )
+    model.tokenizer.decode = lambda tokens, **_: "".join(
+        {0: "watch", 1: "ok", 2: " "}[t] for t in tokens
+    )
+    from listenflow.fastest_whisper._rejection import rejection_settings
+
+    rejection = rejection_settings(reject_phrases=["watch"])
+    actual = model._decode_attempt(
+        encoder,
+        [],
+        with_timestamps=False,
+        temperature=0.4,
+        beam_size=None,
+        best_of=2,
+        rejection=rejection,
+    )
+    assert actual.text == "okok"
+    assert actual.rejection is None
+    assert actual.avg_logprob == pytest.approx(-0.3 / 3)
+    assert len(calls) == 3
+    assert calls[-1]["tokens"].reshape(-1).tolist() == [3, 1]
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-048")
+def test_sampled_batch_stops_repeating_paths_at_three_tokens_and_keeps_their_scores():
+    """Repeated samples finish at the first periodic tail rather than running to the token limit."""
+    model, encoder, calls = sampled_model([[(0, -0.1, 0.1), (1, -0.2, 0.1)]] * 3)
+    model.tokenizer.decode = lambda tokens, **_: "".join(map(str, tokens))
+    from listenflow.fastest_whisper._rejection import rejection_settings
+
+    actual = model._decode_attempt(
+        encoder,
+        [],
+        with_timestamps=False,
+        temperature=0.4,
+        beam_size=None,
+        best_of=2,
+        rejection=rejection_settings(reject_repetition=True),
+    )
+    assert actual.tokens == [0, 0, 0]
+    assert actual.rejection == "repetition"
+    assert actual.avg_logprob == pytest.approx(-0.3 / 4)
+    assert len(calls) == 3

@@ -572,7 +572,7 @@ def test_cached_runtime_accepts_beam_settings_for_short_audio():
     model.encode = lambda _mel: np.empty((0,), dtype=np.float32)
     seen = []
 
-    def decode_short(_encoder, prompt, settings):
+    def decode_short(_encoder, prompt, settings, *, on_metadata=None):
         seen.append((prompt, settings.beam_size))
         return Transcription("hinted", [1, 3])
 
@@ -600,7 +600,7 @@ def test_cached_runtime_omits_best_of_as_five_samples():
     model.encode = lambda _mel: np.empty((0,), dtype=np.float32)
     observed = []
 
-    def decode_short(_encoder, _prompt, settings):
+    def decode_short(_encoder, _prompt, settings, *, on_metadata=None):
         observed.append(settings.best_of)
         return Transcription("sampled", [1, 3])
 

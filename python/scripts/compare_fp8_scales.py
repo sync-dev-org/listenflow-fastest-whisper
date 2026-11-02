@@ -28,9 +28,11 @@ def load_run(directory: Path, language: str, precision: str) -> tuple[list[dict]
         raise ValueError(f"changed result CSV: {csv_path}")
     with csv_path.open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
-    if not rows or len(rows) != metadata["expected_utterances"] or len(rows) != metadata[
-        "completed_utterances"
-    ]:
+    if (
+        not rows
+        or len(rows) != metadata["expected_utterances"]
+        or len(rows) != metadata["completed_utterances"]
+    ):
         raise ValueError(f"inconsistent recording counts: {path}")
     provenance = metadata["provenance"]
     if provenance["language"] != language or provenance["precision"] != precision:
@@ -69,17 +71,14 @@ def _rates(baseline, candidate, ids):
 
 def compare_language(language, fp32, old_fp8, new_fp8):
     """Re-score matched recordings, excluding every retry from deterministic comparisons."""
-    baseline, old, new = (
-        _validated_rows(rows, language) for rows in (fp32, old_fp8, new_fp8)
-    )
+    baseline, old, new = (_validated_rows(rows, language) for rows in (fp32, old_fp8, new_fp8))
     if not baseline or set(baseline) != set(old) or set(baseline) != set(new):
         raise ValueError("runs contain different recording ids")
     all_ids = set(baseline)
     zero = []
     for rows in (baseline, old, new):
         if any(
-            row["reference"] != baseline[key]["reference"]
-            or row["seed"] != baseline[key]["seed"]
+            row["reference"] != baseline[key]["reference"] or row["seed"] != baseline[key]["seed"]
             for key, row in rows.items()
         ):
             raise ValueError("runs contain different references or seeds")
@@ -101,9 +100,17 @@ def compare_language(language, fp32, old_fp8, new_fp8):
 def validate_provenance(baseline, old, new, scale_sha256):
     """Require matching audio, checkpoint, decoding and scoring conditions."""
     for key in (
-        "language", "config", "dataset_revision", "split", "dataset_sha256",
-        "checkpoint_sha256", "settings", "initial_prompt", "normalizer",
-        "error_unit", "seed_algorithm",
+        "language",
+        "config",
+        "dataset_revision",
+        "split",
+        "dataset_sha256",
+        "checkpoint_sha256",
+        "settings",
+        "initial_prompt",
+        "normalizer",
+        "error_unit",
+        "seed_algorithm",
     ):
         if baseline[key] != old[key] or baseline[key] != new[key]:
             raise ValueError(f"paired provenance differs: {key}")

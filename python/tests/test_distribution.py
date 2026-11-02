@@ -135,7 +135,9 @@ def test_wheel_metadata_describes_the_public_package(distributions):
     files = _distribution_files(distributions)["wheel"]
     path = next(path for path in files if str(path).endswith(".dist-info/METADATA"))
     metadata = email.message_from_bytes(files[path])
-    assert metadata.get_payload() == (ROOT / "README.md").read_text(encoding="utf-8")
+    assert metadata.get_payload(decode=True).decode("utf-8") == (ROOT / "README.md").read_text(
+        encoding="utf-8"
+    )
     assert metadata["Description-Content-Type"] == "text/markdown"
     assert metadata["Author-email"] == "minamik <mia@sync.dev>"
     assert metadata["License-Expression"] == "MIT"

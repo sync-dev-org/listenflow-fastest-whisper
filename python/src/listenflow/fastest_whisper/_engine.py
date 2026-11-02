@@ -38,7 +38,9 @@ from listenflow import (
 
 from ._decoding import DecodingSettings, decoding_settings
 from ._languages import LANGUAGES
+from ._longform import SegmentTrace
 from ._precision import PRECISIONS, Precision
+from ._rejection import rejection_settings
 
 _DEFAULT_BOUNDARY_SETTINGS = UtteranceBoundarySettings()
 
@@ -117,6 +119,10 @@ class FastestWhisperEngine(STTEngineBase):
         compression_ratio_threshold: float | None = DecodingSettings.compression_ratio_threshold,
         logprob_threshold: float | None = DecodingSettings.logprob_threshold,
         no_speech_threshold: float | None = DecodingSettings.no_speech_threshold,
+        reject_phrases: list[str] = [],  # noqa: B006 -- copied into immutable patterns, never mutated
+        reject_repetition: bool = False,
+        on_rejected_exhausted: str = "pass",
+        phrase_hit_no_speech: bool = True,
         boundary_settings: UtteranceBoundarySettings = _DEFAULT_BOUNDARY_SETTINGS,
         input_format: EngineInputFormat = EngineInputFormat.PCM_S16LE,
     ) -> None:
@@ -169,6 +175,12 @@ class FastestWhisperEngine(STTEngineBase):
                 compression_ratio_threshold=compression_ratio_threshold,
                 logprob_threshold=logprob_threshold,
                 no_speech_threshold=no_speech_threshold,
+                rejection=rejection_settings(
+                    reject_phrases=reject_phrases,
+                    reject_repetition=reject_repetition,
+                    on_rejected_exhausted=on_rejected_exhausted,
+                    phrase_hit_no_speech=phrase_hit_no_speech,
+                ),
             )
         except (TypeError, ValueError) as error:
             raise ConfigurationError(str(error)) from error
@@ -311,12 +323,24 @@ class FastestWhisperEngine(STTEngineBase):
             audio = np.frombuffer(utterance.pcm, dtype="<f4")
 
         def decode(cancelled: threading.Event) -> list[FinalObservation]:
+            observations: list[FinalObservation] = []
+
+            def observe_segment(segment: SegmentTrace) -> None:
+                if segment.text.strip() or segment.metadata:
+                    observations.append(
+                        FinalObservation(
+                            text=segment.text,
+                            source_offset_s=utterance.start_offset_s + segment.start,
+                            metadata=segment.metadata,
+                        )
+                    )
+
             model = self._model
             model._cancel_requested = cancelled
             try:
                 _check_cancelled(cancelled)
                 settings = self._decoding_settings
-                segments = model.transcribe(
+                model.transcribe(
                     audio,
                     language=self.language,
                     initial_prompt=self.initial_prompt,
@@ -326,15 +350,9 @@ class FastestWhisperEngine(STTEngineBase):
                     compression_ratio_threshold=settings.compression_ratio_threshold,
                     logprob_threshold=settings.logprob_threshold,
                     no_speech_threshold=settings.no_speech_threshold,
+                    segment_trace=observe_segment,
                 )
-                return [
-                    FinalObservation(
-                        text=segment.text,
-                        source_offset_s=utterance.start_offset_s + segment.start,
-                    )
-                    for segment in segments
-                    if segment.text.strip()
-                ]
+                return observations
 
             finally:
                 model._cancel_requested = None

@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
+
+from listenflow import MetadataRecord
 
 from ._audio import N_SAMPLES
 from ._checkpoint import Checkpoint
 from ._decoding import DecodingSettings, decoding_settings
 from ._engines import _open_mel_engine, open_whisper_engine
 from ._inference import TensorRTWhisper
-from ._longform import TimedSegment, transcribe_mel
+from ._longform import SegmentTrace, TimedSegment, transcribe_mel, window_metadata
 
 
 class CachedWhisper(TensorRTWhisper):
@@ -55,6 +57,7 @@ class CachedWhisper(TensorRTWhisper):
         compression_ratio_threshold: float | None = DecodingSettings.compression_ratio_threshold,
         logprob_threshold: float | None = DecodingSettings.logprob_threshold,
         no_speech_threshold: float | None = DecodingSettings.no_speech_threshold,
+        segment_trace: Callable[[SegmentTrace], None] | None = None,
     ) -> list[TimedSegment]:
         settings = decoding_settings(
             beam_size=beam_size,
@@ -63,6 +66,7 @@ class CachedWhisper(TensorRTWhisper):
             compression_ratio_threshold=compression_ratio_threshold,
             logprob_threshold=logprob_threshold,
             no_speech_threshold=no_speech_threshold,
+            rejection=getattr(self, "_settings", DecodingSettings()).rejection,
         )
         prompt_tokens = self.prompt_tokens(initial_prompt)
         if isinstance(language, list) and len(language) == 1:
@@ -73,8 +77,26 @@ class CachedWhisper(TensorRTWhisper):
             self._set_language(
                 language if isinstance(language, str) else self._detect_language(encoder, language)
             )
-            result = self.decode_short(encoder, prompt_tokens, settings)
-            return [TimedSegment(0.0, audio.size / 16_000, result.text)] if result.text else []
+            records: list[MetadataRecord] = []
+            result = self.decode_short(
+                encoder,
+                prompt_tokens,
+                settings,
+                on_metadata=records.extend if segment_trace is not None else None,
+            )
+            end = audio.size / 16_000
+            if segment_trace is not None:
+                segment_trace(
+                    SegmentTrace(
+                        0.0,
+                        end,
+                        result.text,
+                        result.tokens,
+                        0,
+                        window_metadata(tuple(records), 0, 0.0, end),
+                    )
+                )
+            return [TimedSegment(0.0, end, result.text)] if result.text else []
 
         mel = self._mel_spectrogram_long(audio)
         timestamp_begin = self.tokenizer.token_to_id("<|0.00|>")
@@ -99,5 +121,6 @@ class CachedWhisper(TensorRTWhisper):
             initial_prompt_tokens=prompt_tokens,
             no_speech_threshold=settings.no_speech_threshold,
             logprob_threshold=settings.logprob_threshold,
+            segment_trace=segment_trace,
         )
         return [segment for segment in result.segments if segment.text.strip()]

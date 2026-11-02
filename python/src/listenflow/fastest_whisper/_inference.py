@@ -21,6 +21,8 @@ from cuda.bindings import runtime as cudart
 from tensoracle import EngineHandle
 from tokenizers import Tokenizer
 
+from listenflow import MetadataRecord
+
 from ._audio import FFT_SIZE, HOP_SIZE, N_SAMPLES
 from ._checkpoint import Checkpoint, ModelConfig
 from ._decoding import (
@@ -46,6 +48,7 @@ from ._longform import (
     transcribe_mel,
 )
 from ._precision import PRECISIONS
+from ._rejection import NO_REJECTION, RejectionSettings, decode_candidate_text
 
 _DEFAULT_DECODING_SETTINGS = DecodingSettings()
 _CACHE_BOUNDARIES = (1, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448)
@@ -779,6 +782,7 @@ class TensorRTWhisper:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.precision = precision
         self.device = device
+        self._settings = settings or _DEFAULT_DECODING_SETTINGS
         self._encoder = self._decoder = self._mel = None
         self.encoder_engine = self.decoder_engine = None
         self._encoder_handle = self._decoder_handle = None
@@ -1180,10 +1184,11 @@ class TensorRTWhisper:
         beam_size: int | None,
         best_of: int | None,
         sample_token: Callable[[np.ndarray], int] | None = None,
+        rejection: RejectionSettings = NO_REJECTION,
     ) -> DecodeAttempt:
         """Read one window with the chosen candidate selection rule."""
         if not with_timestamps and temperature == 0 and beam_size is None:
-            return self._greedy_attempt(encoder, prompt)
+            return self._greedy_attempt(encoder, prompt, rejection=rejection)
         previous = self.tokenizer.token_to_id("<|startofprev|>")
         no_speech = self.tokenizer.token_to_id("<|nospeech|>")
         timestamp_begin = self.tokenizer.token_to_id("<|0.00|>") if with_timestamps else None
@@ -1206,9 +1211,13 @@ class TensorRTWhisper:
             and best_of == self._sampled_batch
         ):
             chosen, no_speech_prob = self._sampled_candidates(
-                encoder, prefix, temperature=temperature, with_timestamps=with_timestamps
+                encoder,
+                prefix,
+                temperature=temperature,
+                with_timestamps=with_timestamps,
+                rejection=rejection,
             )
-            return self._candidate_attempt(chosen, no_speech_prob, temperature)
+            return self._candidate_attempt(chosen, no_speech_prob, temperature, rejection)
         first_logits = self.logits(prefix, encoder)
         if no_speech is None:
             no_speech_prob = float("nan")
@@ -1243,10 +1252,26 @@ class TensorRTWhisper:
             temperature=temperature,
             best_of=best_of,
             sample_token=sample_token,
+            stop_candidate=self._candidate_stop(rejection),
         )
-        return self._candidate_attempt(chosen, no_speech_prob, temperature)
+        return self._candidate_attempt(chosen, no_speech_prob, temperature, rejection)
 
-    def _candidate_attempt(self, chosen, no_speech_prob, temperature):
+    def _candidate_stop(self, rejection):
+        if not rejection.enabled:
+            return None
+
+        def stop(tokens, final):
+            text_tokens = [token for token in tokens if token < self.eot]
+            text = (
+                decode_candidate_text(self.tokenizer, text_tokens, final=final)
+                if rejection.patterns
+                else ""
+            )
+            return rejection.reason(text_tokens, text, final=final) is not None
+
+        return stop
+
+    def _candidate_attempt(self, chosen, no_speech_prob, temperature, rejection=NO_REJECTION):
         text_tokens = [token for token in chosen.tokens if token < self.eot]
         text = self.tokenizer.decode(text_tokens, skip_special_tokens=False).strip()
         text_bytes = text.encode("utf-8")
@@ -1258,9 +1283,12 @@ class TensorRTWhisper:
             no_speech_prob,
             compression_ratio,
             temperature,
+            rejection.reason(text_tokens, text, final=True) if rejection.enabled else None,
         )
 
-    def _sampled_candidates(self, encoder, prefix, *, temperature, with_timestamps):
+    def _sampled_candidates(
+        self, encoder, prefix, *, temperature, with_timestamps, rejection=NO_REJECTION
+    ):
         """Advance all candidates together, retaining only K/V and the sampled result."""
         c = self.config
         batch = self._sampled_batch
@@ -1275,6 +1303,7 @@ class TensorRTWhisper:
         no_timestamps = self.tokenizer.token_to_id("<|notimestamps|>") if with_timestamps else None
         speech_position = len(prefix) - (3 if with_timestamps else len(self.initial_tokens))
         no_speech_prob = float("nan")
+        stop_candidate = self._candidate_stop(rejection)
 
         def step(tokens, position, *, first, select):
             nonlocal cache, no_speech_prob
@@ -1336,6 +1365,8 @@ class TensorRTWhisper:
                         finished[row] = True
                     else:
                         paths[row].append(int(tokens[row]))
+                        if stop_candidate is not None and stop_candidate(paths[row], False):
+                            finished[row] = True
                 if finished.all() or len(prefix) + index + 1 > c.text_positions:
                     break
                 if index + 1 == c.text_positions // 2:
@@ -1349,9 +1380,18 @@ class TensorRTWhisper:
             _release_tensors(cache)
 
     def decode_short(
-        self, encoder: _EncodedAudio, prompt: list[int], settings: DecodingSettings
+        self,
+        encoder: _EncodedAudio,
+        prompt: list[int],
+        settings: DecodingSettings,
+        *,
+        on_metadata: Callable[[tuple[MetadataRecord, ...]], None] | None = None,
     ) -> Transcription:
-        if settings.greedy_only and settings.no_speech_threshold is None:
+        if (
+            settings.greedy_only
+            and settings.no_speech_threshold is None
+            and not settings.rejection.enabled
+        ):
             return self.greedy_decode(encoder, prompt)
         result = decode_with_fallback(
             lambda temperature, beam_size, best_of: self._decode_attempt(
@@ -1361,6 +1401,7 @@ class TensorRTWhisper:
                 temperature=temperature,
                 beam_size=beam_size,
                 best_of=best_of,
+                rejection=settings.rejection,
             ),
             temperatures=settings.temperatures,
             beam_size=settings.beam_size,
@@ -1368,6 +1409,7 @@ class TensorRTWhisper:
             compression_ratio_threshold=settings.compression_ratio_threshold,
             logprob_threshold=settings.logprob_threshold,
             no_speech_threshold=settings.no_speech_threshold,
+            rejection=settings.rejection,
         )
         skip_silence = should_skip_window(
             result.no_speech_prob,
@@ -1375,12 +1417,14 @@ class TensorRTWhisper:
             no_speech_threshold=settings.no_speech_threshold,
             logprob_threshold=settings.logprob_threshold,
         )
+        if on_metadata is not None:
+            on_metadata(result.metadata)
         return Transcription("" if skip_silence else result.text, result.tokens + [self.eot])
 
     def decode_long(
         self, encoder: _EncodedAudio, prompt: list[int], settings: DecodingSettings
     ) -> DecodedWindow:
-        if settings.greedy_only:
+        if settings.greedy_only and not settings.rejection.enabled:
             return self.timestamp_decode(encoder, prompt)
         result = decode_with_fallback(
             lambda temperature, beam_size, best_of: self._decode_attempt(
@@ -1390,6 +1434,7 @@ class TensorRTWhisper:
                 temperature=temperature,
                 beam_size=beam_size,
                 best_of=best_of,
+                rejection=settings.rejection,
             ),
             temperatures=settings.temperatures,
             beam_size=settings.beam_size,
@@ -1397,9 +1442,15 @@ class TensorRTWhisper:
             compression_ratio_threshold=settings.compression_ratio_threshold,
             logprob_threshold=settings.logprob_threshold,
             no_speech_threshold=settings.no_speech_threshold,
+            rejection=settings.rejection,
         )
         return DecodedWindow(
-            result.tokens, result.avg_logprob, result.no_speech_prob, result.temperature
+            result.tokens,
+            result.avg_logprob,
+            result.no_speech_prob,
+            result.temperature,
+            rejected=result.rejection is not None,
+            metadata=result.metadata,
         )
 
     def greedy_decode(
@@ -1408,7 +1459,9 @@ class TensorRTWhisper:
         result = self._greedy_attempt(encoder, prompt or [], score=False)
         return Transcription(result.text, result.tokens + [self.eot])
 
-    def _greedy_attempt(self, encoder, prompt, *, score=True) -> DecodeAttempt:
+    def _greedy_attempt(
+        self, encoder, prompt, *, score=True, rejection=NO_REJECTION
+    ) -> DecodeAttempt:
         previous = self.tokenizer.token_to_id("<|startofprev|>") if prompt else None
         if prompt and previous is None:
             raise ValueError("checkpoint tokenizer lacks the previous-text token")
@@ -1421,6 +1474,7 @@ class TensorRTWhisper:
         result: list[int] = []
         sum_logprob = np.float32(0.0)
         no_speech_prob = float("nan")
+        stop_candidate = self._candidate_stop(rejection)
         speech_position = len(prefix) - len(self.initial_tokens)
         device_selection = "token" in getattr(getattr(self, "_decoder", None), "outputs", ())
         if device_selection:
@@ -1464,6 +1518,9 @@ class TensorRTWhisper:
                 result.append(token)
                 if token == self.eot:
                     break
+                if stop_candidate is not None and stop_candidate(result, False):
+                    result.append(self.eot)
+                    break
                 prefix.append(token)
                 if len(prefix) > self.config.text_positions:
                     result.append(self.eot)
@@ -1482,6 +1539,7 @@ class TensorRTWhisper:
             no_speech_prob,
             len(text_bytes) / len(zlib.compress(text_bytes)),
             0.0,
+            rejection.reason(result[:-1], text, final=True) if rejection.enabled else None,
         )
 
     def timestamp_decode(self, encoder: _EncodedAudio, prompt: list[int]) -> DecodedWindow:

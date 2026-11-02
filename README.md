@@ -21,7 +21,7 @@ Install from PyPI:
 pip install listenflow-fastest-whisper
 ```
 
-The package installs listenflow core (`listenflow>=0.17.6`) and tensoracle from
+The package installs listenflow core (`listenflow>=0.22.0`) and tensoracle from
 PyPI as normal dependencies.
 
 The Linux wheel includes the native fc1 plugin and its sm86, sm89, and sm120
@@ -126,6 +126,48 @@ before `prepare()` or GPU access. The engine copies the temperature sequence
 at construction and uses the selected settings for every utterance and stream,
 including all three precisions, long utterances, and recognition with `initial_prompt`.
 
+The engine constructor also accepts these phrase and repetition rejection settings:
+
+| Argument | Default | Effect |
+| --- | --- | --- |
+| `reject_phrases` | `[]` | A list of strings identifying phrases to reject during decoding. |
+| `reject_repetition` | `False` | Reject consecutive repetitions of the same token sequence at the generated tail. |
+| `on_rejected_exhausted` | `"pass"` | Emit the last rejected attempt's text after retries are exhausted; `"drop"` suppresses that window's text instead. Silence is handled before either choice. |
+| `phrase_hit_no_speech` | `True` | Treat a phrase-rejected window as silence when its no-speech probability exceeds `no_speech_threshold`, without requiring low average log probability. |
+
+The engine copies the phrase list at construction and uses these settings for
+every utterance and stream; callers do not change them per recognition call.
+With `reject_phrases=[]` and `reject_repetition=False`, rejection is disabled and
+the engine preserves its existing output selection.
+
+Phrase matching normalizes both text and phrases by lowercasing, removing Unicode
+punctuation, collapsing consecutive whitespace to one space, and trimming surrounding
+whitespace. A match must start and end at word boundaries. Word characters are
+letters, numbers, underscores, and Unicode combining marks; other characters and
+the ends of the text form boundaries. During generation, a phrase matches only
+after its following boundary is confirmed. For example, `DON’T forget to subscribe`
+matches `don't forget to subscribe`; `foo,bar` becomes `foobar`, and `go` does not
+match `going`. The engine does not segment text into words for languages that do
+not use spaces between words.
+
+Invalid rejection settings raise `ConfigurationError` during construction, before
+`prepare()` or GPU access: `reject_phrases` must be a list of strings, each phrase
+must remain nonempty after normalization, `reject_repetition` and
+`phrase_hit_no_speech` must be booleans, and `on_rejected_exhausted` must be
+`"pass"` or `"drop"`.
+
+Each candidate stops generating when a phrase or repetition match is confirmed,
+but remains in the existing candidate ranking. If the selected candidate is
+rejected, the engine first applies the silence rules to that window, then retries
+at the next temperature if the window is not silent. This also applies with
+`beam_size` greater than one. The temperature sequence determines the retry count;
+there is no separate limit. After the last rejected, nonsilent attempt, the engine
+uses `on_rejected_exhausted`. If the last attempt fails only the compression-ratio
+or average-log-probability check, the engine retains the official implementation's
+behavior regardless of this setting. With `phrase_hit_no_speech=False` or
+`no_speech_threshold=None`, the engine uses the standard silence rule. An empty
+phrase list makes `phrase_hit_no_speech` have no effect on output.
+
 Call `await engine.aclose()` when finished to return its TensorRT execution contexts,
 CUDA graphs, streams, engines, and runtimes. When stopping a stream early, close the returned
 iterator explicitly with `await stream.aclose()` or `contextlib.aclosing`. Caller
@@ -175,6 +217,39 @@ match, `prepare()` automatically rebuilds that engine and continues. There is no
 caller setting for rebuilding engines. If rebuilding fails or the rebuilt engine
 cannot be opened, `prepare()` raises `EnvironmentUnavailableError` and preserves the
 underlying error in `__cause__`.
+
+### Rejected-window records
+
+An exhausted rejected window produces one record in listenflow's `Final.metadata`.
+A phrase-rejected window that is treated as silence also produces a record.
+Each record is a tuple of `(key, value)` pairs; `dict(record)` provides named
+access to its values.
+
+| Key | Value | Meaning |
+| --- | --- | --- |
+| `type` | `"rejection"` | Identifies a rejected-window record from this engine. |
+| `outcome` | `"passed"`, `"dropped"`, or `"no_speech"` | `"passed"`: rejected text was emitted. `"dropped"`: its output was suppressed after exhausting retries. `"no_speech"`: the phrase-rejected window was treated as silence. |
+| `reason` | `"phrase"` or `"repetition"` | The reason the selected attempt was rejected. |
+| `phrase` | `str` or `None` | The matching phrase exactly as supplied in `reject_phrases`, preserving its case and punctuation; `None` for repetition. |
+| `text` | `str` | The last rejected attempt's text when generation stopped, retained even when its output is dropped or treated as silence. |
+| `temperature` | `float` | The last rejected attempt's decoding temperature. |
+| `window` | `int` | The window's zero-based index within its utterance. |
+| `window_start_s`, `window_end_s` | `float` | The window's start and end in seconds from the utterance's start. |
+
+`Final.utterance_id` identifies the utterance. Records follow window order.
+When a rejected window produces text segments, only its first text `Final`
+carries the record; passing a rejected window adds no `Final` events. A window
+that produces no visible text, including dropped, silent, and whitespace-only
+results, instead produces one `Final(text="", metadata=...)`. Its `ts_offset_s`
+is the utterance's start plus `window_start_s`. Both listenflow's `transcribe()`
+and `transcribe_utterance()` preserve these results; inspect `final.text` before
+displaying recognized words.
+
+A rejected attempt followed by a successful retry produces no record. A
+repetition-rejected window treated as silence also produces no record. Windows
+without text or a record produce no `Final`. With rejection disabled, all
+`Final.metadata` values are `()` and transcript text and event counts retain their
+existing behavior.
 
 ## Accuracy by language
 

@@ -46,7 +46,7 @@ class DecodeRetryRecorder(AbstractContextManager):
         original_unit = getattr(TensorRTWhisper, self.unit_method)
 
         @wraps(original_unit)
-        def unit(model, encoder, prompt, settings):
+        def unit(model, encoder, prompt, settings, **kwargs):
             record = {
                 "attempts": 0,
                 "temperatures": [],
@@ -57,7 +57,7 @@ class DecodeRetryRecorder(AbstractContextManager):
             previous = self._current
             self._current = record
             try:
-                result = original_unit(model, encoder, prompt, settings)
+                result = original_unit(model, encoder, prompt, settings, **kwargs)
                 record["tokens"] = list(result.tokens)
                 return result
             finally:

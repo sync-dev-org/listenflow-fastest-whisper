@@ -78,7 +78,8 @@ def _engine(
         precision=precision,
         device=device,
         language=language,
-        boundary_settings=UtteranceBoundarySettings(preroll_s=0),
+        # Keep the fixture's leading samples for comparisons with full-waveform references.
+        boundary_settings=decoding_options.pop("boundary_settings", UtteranceBoundarySettings()),
         initial_prompt=initial_prompt,
         **decoding_options,
     )
@@ -359,18 +360,23 @@ def test_auto_detects_and_transcribes_english_and_japanese(gpu, engine_loop):
     actual_english = [
         event.text for event in _events(engine_loop, automatic, english) if isinstance(event, Final)
     ]
+    engine_loop.run(automatic.aclose())
+    # RMS detection splits this pronunciation fixture into words at the default
+    # silence threshold. Compare language selection for one Japanese utterance.
+    japanese_boundary = UtteranceBoundarySettings(silence_threshold_s=3.0)
+    automatic_japanese = _engine(gpu, language=None, boundary_settings=japanese_boundary)
     actual_japanese = [
         event.text
-        for event in _events(engine_loop, automatic, japanese)
+        for event in _events(engine_loop, automatic_japanese, japanese)
         if isinstance(event, Final)
     ]
-    engine_loop.run(automatic.aclose())
+    engine_loop.run(automatic_japanese.aclose())
     fixed = _engine(gpu, language="en")
     expected_english = [
         event.text for event in _events(engine_loop, fixed, english) if isinstance(event, Final)
     ]
     engine_loop.run(fixed.aclose())
-    fixed_japanese = _engine(gpu, language="ja")
+    fixed_japanese = _engine(gpu, language="ja", boundary_settings=japanese_boundary)
     expected_japanese = [
         event.text
         for event in _events(engine_loop, fixed_japanese, japanese)
@@ -388,14 +394,21 @@ def test_auto_detects_and_transcribes_english_and_japanese(gpu, engine_loop):
 @pytest.mark.req("SP-LFFASTESTWHISPER-042")
 def test_language_list_transcribes_english_and_japanese_and_restricts_korean(gpu, engine_loop):
     """A Japanese/English list preserves both languages and excludes Korean on Korean speech."""
-    selected = _engine(gpu, language=["ja", "en"], temperature=0.0)
+    # Keep Japanese pronunciation words together for one language selection.
     fixtures = (
-        ("en", "small_boat_16khz_mono_s16le.wav"),
-        ("ja", "ja_pronunciation_practice5_25s_16khz_mono_s16le.wav"),
+        ("en", "small_boat_16khz_mono_s16le.wav", UtteranceBoundarySettings()),
+        (
+            "ja",
+            "ja_pronunciation_practice5_25s_16khz_mono_s16le.wav",
+            UtteranceBoundarySettings(silence_threshold_s=3.0),
+        ),
     )
     actual_texts = {}
-    try:
-        for language, fixture in fixtures:
+    for language, fixture, boundary_settings in fixtures:
+        selected = _engine(
+            gpu, language=["ja", "en"], temperature=0.0, boundary_settings=boundary_settings
+        )
+        try:
             actual_texts[language] = [
                 event.text
                 for event in _events(engine_loop, selected, _pcm(fixture))
@@ -403,11 +416,13 @@ def test_language_list_transcribes_english_and_japanese_and_restricts_korean(gpu
             ]
             expected_token = selected._model.tokenizer.token_to_id(f"<|{language}|>")
             assert selected._model.initial_tokens[1] == expected_token
-    finally:
-        engine_loop.run(selected.aclose())
-    for language, fixture in fixtures:
+        finally:
+            engine_loop.run(selected.aclose())
+    for language, fixture, boundary_settings in fixtures:
         pcm = _pcm(fixture)
-        fixed = _engine(gpu, language=language, temperature=0.0)
+        fixed = _engine(
+            gpu, language=language, temperature=0.0, boundary_settings=boundary_settings
+        )
         try:
             expected = [
                 event.text for event in _events(engine_loop, fixed, pcm) if isinstance(event, Final)

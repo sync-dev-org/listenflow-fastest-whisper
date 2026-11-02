@@ -72,7 +72,9 @@ def test_multiple_windows_decoded_only_at_temperature_zero_remain_in_the_compari
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-040")
-@pytest.mark.parametrize("defect", ["missing", "duplicate", "reference", "score", "seed", "temperature"])
+@pytest.mark.parametrize(
+    "defect", ["missing", "duplicate", "reference", "score", "seed", "temperature"]
+)
 def test_comparison_rejects_unpaired_or_invalid_measurements(defect):
     """Incomplete IDs, changed references or seeds, false scores and absent trials stop comparison."""
     from scripts.compare_fp8_scales import compare_language
@@ -115,7 +117,11 @@ def test_saved_run_requires_completion_counts_and_unchanged_csv(tmp_path):
     target = path.with_suffix(".json")
     target.write_text(json.dumps(metadata))
     assert load_run(tmp_path, "en", "fp8")[0] == rows
-    for field, value in (("status", "stopped"), ("completed_utterances", 1), ("csv_sha256", "wrong")):
+    for field, value in (
+        ("status", "stopped"),
+        ("completed_utterances", 1),
+        ("csv_sha256", "wrong"),
+    ):
         target.write_text(json.dumps({**metadata, field: value}))
         with pytest.raises(ValueError):
             load_run(tmp_path, "en", "fp8")

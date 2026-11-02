@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
+
+from listenflow import MetadataRecord
+
+from ._rejection import NO_REJECTION, RejectionSettings
 
 
 @dataclass(frozen=True)
@@ -23,6 +27,8 @@ class DecodeAttempt:
     no_speech_prob: float
     compression_ratio: float
     temperature: float
+    rejection: str | None = None
+    metadata: tuple[MetadataRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,7 @@ class DecodingSettings:
     compression_ratio_threshold: float | None = 2.4
     logprob_threshold: float | None = -1.0
     no_speech_threshold: float | None = 0.6
+    rejection: RejectionSettings = NO_REJECTION
 
     @property
     def greedy_only(self) -> bool:
@@ -47,6 +54,7 @@ def decoding_settings(
     compression_ratio_threshold: float | None = DecodingSettings.compression_ratio_threshold,
     logprob_threshold: float | None = DecodingSettings.logprob_threshold,
     no_speech_threshold: float | None = DecodingSettings.no_speech_threshold,
+    rejection: RejectionSettings = NO_REJECTION,
 ) -> DecodingSettings:
     if type(beam_size) is not int or beam_size < 1:
         raise ValueError("beam_size must be a positive integer")
@@ -87,6 +95,7 @@ def decoding_settings(
         compression_ratio_threshold,
         logprob_threshold,
         no_speech_threshold,
+        rejection,
     )
 
 
@@ -130,6 +139,7 @@ def search_candidates(
     temperature: float = 0.0,
     best_of: int | None = None,
     sample_token: Callable[[np.ndarray], int] | None = None,
+    stop_candidate: Callable[[list[int], bool], bool] | None = None,
 ) -> Candidate:
     """Choose a completed sentence from beam paths or independent samples."""
     if beam_size is not None:
@@ -159,9 +169,13 @@ def search_candidates(
                     if len(finished) < beam_size:
                         finished[sequence] = Candidate(candidate.tokens[:-1], candidate.sum_logprob)
                 elif len(live) < beam_size:
-                    live.append(candidate)
-                    if len(live) == beam_size:
-                        break
+                    if stop_candidate is not None and stop_candidate(candidate.tokens, False):
+                        if len(finished) < beam_size:
+                            finished[(*sequence, eot)] = candidate
+                    else:
+                        live.append(candidate)
+                        if len(live) == beam_size:
+                            break
             if len(finished) >= beam_size or not live:
                 break
             if len(initial_tokens) + len(live[0].tokens) > context_length:
@@ -201,6 +215,8 @@ def search_candidates(
             if token == eot:
                 break
             tokens.append(token)
+            if stop_candidate is not None and stop_candidate(tokens, False):
+                break
             if len(prefix) + 1 > context_length:
                 break
         candidates.append(Candidate(tokens, float(score)))
@@ -216,16 +232,57 @@ def decode_with_fallback(
     compression_ratio_threshold: float | None,
     logprob_threshold: float | None,
     no_speech_threshold: float | None,
+    rejection: RejectionSettings = NO_REJECTION,
 ) -> DecodeAttempt:
-    """Retry a window only while the official failure checks request it."""
+    """Retry failed or rejected winners, applying silence before advancing temperature."""
     if not temperatures:
         raise ValueError("temperature sequence must contain at least one value")
+
+    def rejected_result(attempt: DecodeAttempt, outcome: str) -> DecodeAttempt:
+        metadata = ()
+        if outcome != "no_speech" or attempt.rejection == "phrase":
+            record: MetadataRecord = (
+                ("type", "rejection"),
+                ("outcome", outcome),
+                ("reason", attempt.rejection),
+                (
+                    "phrase",
+                    rejection.matched_phrase(attempt.text, final=True)
+                    if attempt.rejection == "phrase"
+                    else None,
+                ),
+                ("text", attempt.text),
+                ("temperature", float(attempt.temperature)),
+            )
+            metadata = (record,)
+        return replace(
+            attempt,
+            tokens=attempt.tokens if outcome == "passed" else [],
+            text=attempt.text if outcome == "passed" else "",
+            metadata=metadata,
+        )
+
     for temperature in temperatures:
         attempt = decode(
             temperature,
             beam_size if temperature == 0 and beam_size > 1 else None,
             best_of if temperature > 0 else None,
         )
+        if attempt.rejection is not None:
+            silent = should_skip_window(
+                attempt.no_speech_prob,
+                attempt.avg_logprob,
+                no_speech_threshold=no_speech_threshold,
+                logprob_threshold=logprob_threshold,
+            ) or (
+                attempt.rejection == "phrase"
+                and rejection.phrase_hit_no_speech
+                and no_speech_threshold is not None
+                and attempt.no_speech_prob > no_speech_threshold
+            )
+            if silent:
+                return rejected_result(attempt, "no_speech")
+            continue
         failed = (
             compression_ratio_threshold is not None
             and attempt.compression_ratio > compression_ratio_threshold
@@ -238,4 +295,6 @@ def decode_with_fallback(
         )
         if not failed or silent:
             break
+    if attempt.rejection is not None:
+        return rejected_result(attempt, "dropped" if rejection.on_exhausted == "drop" else "passed")
     return attempt

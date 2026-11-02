@@ -73,9 +73,13 @@ class _Model:
         self.closed += 1
 
     def transcribe(self, audio, **kwargs):
+        from listenflow.fastest_whisper._longform import SegmentTrace
+
         self.audio.append(audio.copy())
         if kwargs.get("language", "en") is None:
             self.detect_language(audio)
+        for segment in self.segments:
+            kwargs["segment_trace"](SegmentTrace(segment.start, segment.end, segment.text, [], 0))
         return self.segments
 
     def detect_language(self, audio):
@@ -164,7 +168,7 @@ def test_health_reports_hint_only_after_a_successful_decode(tmp_path, native, pr
     class PromptModel(_Model):
         def transcribe(self, audio, initial_prompt=None, **kwargs):
             observed.append((initial_prompt, engine.health().bias_application))
-            return super().transcribe(audio)
+            return super().transcribe(audio, **kwargs)
 
     native(PromptModel())
     assert engine.health().bias_application is None
@@ -263,8 +267,11 @@ def test_single_utterance_keeps_silence_that_segmentation_auto_splits(tmp_path, 
         ends = [event for event in automatic if isinstance(event, UtteranceEnd)]
         assert len(starts) == len(ends) == len(model.audio) == 2
         assert [event.utterance_id for event in starts] == [event.utterance_id for event in ends]
-        assert [event.ts_offset_s for event in starts] == pytest.approx([0.1, 1.2])
-        for audio, utterance in zip(model.audio, (first + gap, second + trailing), strict=True):
+        # RMS blocks start every 256 samples; the first voiced block includes
+        # the last 64 samples of leading silence and closes after 0.8 s of silence.
+        assert [event.ts_offset_s for event in starts] == pytest.approx([0.096, 1.2])
+        utterances = (pcm[1536 * 2 : 16128 * 2], second + trailing)
+        for audio, utterance in zip(model.audio, utterances, strict=True):
             np.testing.assert_array_equal(
                 audio, np.frombuffer(utterance, dtype="<i2").astype(np.float32) / 32768
             )
@@ -272,7 +279,7 @@ def test_single_utterance_keeps_silence_that_segmentation_auto_splits(tmp_path, 
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-019")
-@pytest.mark.parametrize("boundary_options", [{"min_voiced_s": 1.0}, {"voice_threshold": 0.9}])
+@pytest.mark.parametrize("boundary_options", [{"min_voiced_s": 1.0}, {"voice_rms_threshold": 0.9}])
 def test_single_utterance_bypasses_voice_and_duration_filters(tmp_path, native, boundary_options):
     """A caller-selected short utterance is decoded even when automatic filters reject it."""
     model = native(_Model())
@@ -376,7 +383,8 @@ def test_stream_requires_prepare_and_health_records_progress(tmp_path, native):
     events = native.run(run())
     assert [type(event) for event in events] == [UtteranceStart, Partial, Final, UtteranceEnd]
     assert events[2].text == "hello"
-    assert events[2].ts_offset_s == pytest.approx(0.26)
+    # Quiet and speech share the first 256-sample RMS block, starting at zero.
+    assert events[2].ts_offset_s == pytest.approx(0.25)
     assert engine.health().processed_pcm_chunks == 2
     assert engine.health().emitted_events == 4
     assert len(model.audio) == 1
@@ -513,7 +521,7 @@ def test_second_stream_is_rejected_while_first_continues(tmp_path, native):
     """Concurrent streams are refused without closing the earlier stream."""
     native(_Model())
     engine = _engine(tmp_path)
-    speech = np.full(160, 1000, dtype="<i2").tobytes()
+    speech = np.full(256, 1000, dtype="<i2").tobytes()
 
     async def run():
         await engine.prepare()

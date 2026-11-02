@@ -59,8 +59,11 @@ def runtime(monkeypatch):
         language_scores=None,
         prefixes=None,
         first_probabilities=None,
+        sequence=None,
+        word=None,
     ):
-        word = "A" * 100 if repeated else "A"
+        if word is None:
+            word = "A" * 100 if repeated else "A"
         vocab = {
             word: 0,
             "B": 1,
@@ -88,6 +91,7 @@ def runtime(monkeypatch):
 
             def __init__(self, _checkpoint, *, precision, **_options):
                 self.precision = precision
+                self._settings = _options.get("settings", decoding_settings())
                 self.config = SimpleNamespace(n_mels=1, audio_positions=1500, text_positions=32)
                 self.tokenizer = tokenizer
                 self.initial_tokens = [5, 6, 7, 8]
@@ -133,6 +137,10 @@ def runtime(monkeypatch):
                 output = np.full((len(prefix), len(vocab)), -np.inf, dtype=np.float32)
                 output[task - 2, 4] = log(no_speech)
                 output[task - 2, 0] = log(1 - no_speech)
+                if sequence is not None:
+                    token = sequence[len(generated)] if len(generated) < len(sequence) else 3
+                    output[-1, token] = 0
+                    return output
                 if long and not generated:
                     output[-1, 11] = 0
                     return output
@@ -261,9 +269,104 @@ def _texts(runner, engine, *, seconds=1, utterances=1):
 
     async def collect():
         await engine.prepare()
-        return [event.text async for event in engine.stream(chunks()) if isinstance(event, Final)]
+        return [
+            event.text
+            async for event in engine.stream(chunks())
+            if isinstance(event, Final) and event.text
+        ]
 
     return runner.run(collect())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-047")
+@pytest.mark.req("SP-LFFASTESTWHISPER-049")
+@pytest.mark.parametrize("seconds", [1, 31])
+@pytest.mark.parametrize("temperature", [0.0, 0.4, (0.0, 0.4)])
+@pytest.mark.parametrize("no_speech_threshold", [None, 0.6])
+@pytest.mark.parametrize("mode", ["pass", "drop"])
+def test_phrase_exhaustion_controls_short_and_timestamped_window_outputs(
+    tmp_path, runtime, seconds, temperature, no_speech_threshold, mode
+):
+    """The constructor's immutable phrase policy reaches every window and decoding mode."""
+    runtime(starts=(0,))
+    engine = _engine(
+        tmp_path,
+        temperature=temperature,
+        reject_phrases=["A"],
+        no_speech_threshold=no_speech_threshold,
+        on_rejected_exhausted=mode,
+    )
+    with asyncio.Runner() as runner:
+        assert _texts(runner, engine, seconds=seconds) == (
+            ["A C"] * (2 if seconds > 30 else 1) if mode == "pass" else []
+        )
+        runner.run(engine.aclose())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-047")
+@pytest.mark.parametrize("beam_size", [1, 2])
+@pytest.mark.parametrize("seconds", [1, 31])
+def test_losing_phrase_candidate_does_not_advance_temperature_in_stream_output(
+    tmp_path, runtime, beam_size, seconds
+):
+    """An unselected rejected beam or sample leaves the clean winning sentence unchanged."""
+    prefixes = []
+    runtime(starts=(0, 1), prefixes=prefixes, first_probabilities={0: 0.3, 1: 0.7})
+    engine = _engine(
+        tmp_path,
+        beam_size=beam_size,
+        best_of=2,
+        temperature=(0.4, 0.8) if beam_size == 1 else (0.0, 0.4),
+        reject_phrases=["A"],
+        on_rejected_exhausted="drop",
+    )
+    with asyncio.Runner() as runner:
+        assert _texts(runner, engine, seconds=seconds) == ["B"] * (2 if seconds > 30 else 1)
+        # Each trial shares its first logits across candidates.
+        starts = [prefix for prefix in prefixes if prefix[-1] in (7, 8)]
+        assert len(starts) == (2 if seconds > 30 else 1)
+        runner.run(engine.aclose())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-050")
+@pytest.mark.parametrize("seconds", [1, 31])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_phrase_silence_suppresses_high_confidence_text_only_when_requested(
+    tmp_path, runtime, seconds, enabled
+):
+    """High no-speech probability suppresses a phrase hit even when its logprob would pass."""
+    runtime(no_speech=0.8)
+    engine = _engine(tmp_path, temperature=0.0, reject_phrases=["A"], phrase_hit_no_speech=enabled)
+    with asyncio.Runner() as runner:
+        assert _texts(runner, engine, seconds=seconds) == (
+            [] if enabled else ["A C"] * (2 if seconds > 30 else 1)
+        )
+        runner.run(engine.aclose())
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-049")
+@pytest.mark.parametrize("sequence", [[11, 0, 61, 61, 1, 2], [36, 1, 2]])
+def test_pass_keeps_an_unfinished_timestamp_sentence_until_the_window_end_without_redecoding(
+    tmp_path, runtime, sequence
+):
+    """Rejected final text retains its opening timestamp and consumes each full audio window once."""
+    prefixes = []
+    runtime(sequence=sequence, prefixes=prefixes)
+    engine = _engine(tmp_path, temperature=0.0, reject_phrases=["B"])
+    with asyncio.Runner() as runner:
+        runner.run(engine.prepare())
+        segments = engine._model.transcribe(np.zeros(60 * 16_000), temperature=0.0)
+        tail = [segment for segment in segments if segment.text.strip() == "B C"]
+        start = 1.0 if sequence[0] == 11 else 0.5
+        assert [(segment.start, segment.end) for segment in tail] == [
+            (start, 30.0),
+            (30.0 + start, 60.0),
+        ]
+        assert [segment.text.strip() for segment in segments] == (
+            ["A", "B C", "A", "B C"] if sequence[0] == 11 else ["B C", "B C"]
+        )
+        assert len([prefix for prefix in prefixes if prefix[-1] == 7]) == 2
+        runner.run(engine.aclose())
 
 
 # Ten equally likely initial tokens followed by certain EOT give avg_logprob < -1.

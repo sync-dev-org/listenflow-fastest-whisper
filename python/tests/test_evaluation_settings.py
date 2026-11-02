@@ -5,7 +5,7 @@ import hashlib
 import json
 import platform
 import sys
-from dataclasses import asdict, replace
+from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, datetime
 from math import log
 from pathlib import Path
@@ -290,7 +290,11 @@ def cpu_tensor_rt(tmp_path, monkeypatch):
             observed.greedy_calls.append(values["self"].precision)
         elif name == "decode_with_fallback":
             observed.fallback_calls.append(
-                {field: values[field] for field in asdict(DecodingSettings())}
+                {
+                    field: asdict(value) if is_dataclass(value) else value
+                    for field in asdict(DecodingSettings())
+                    for value in (values[field],)
+                }
             )
         elif name == "_decode_attempt":
             observed.attempt_calls.append(

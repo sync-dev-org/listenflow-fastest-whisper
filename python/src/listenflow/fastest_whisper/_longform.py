@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from listenflow import MetadataRecord
+
 from ._audio import HOP_SIZE, N_SAMPLES
 from ._decoding import DecodingSettings, should_skip_window
 
@@ -20,6 +22,8 @@ class DecodedWindow:
     avg_logprob: float
     no_speech_prob: float
     temperature: float = 0.0
+    rejected: bool = False
+    metadata: tuple[MetadataRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -29,6 +33,16 @@ class TimedSegment:
     text: str
 
 
+def window_metadata(
+    metadata: tuple[MetadataRecord, ...], index: int, start: float, end: float
+) -> tuple[MetadataRecord, ...]:
+    """Locate each rejection record within its utterance."""
+    return tuple(
+        record + (("window", index), ("window_start_s", start), ("window_end_s", end))
+        for record in metadata
+    )
+
+
 @dataclass(frozen=True)
 class SegmentTrace:
     start: float
@@ -36,6 +50,7 @@ class SegmentTrace:
     text: str
     tokens: list[int]
     seek: int
+    metadata: tuple[MetadataRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,12 +141,16 @@ def transcribe_mel(
     initial_prompt_length = len(all_tokens)
     prompt_reset_since = 0
     segments: list[TimedSegment] = []
+    window_index = 0
     while seek < content_frames:
         segment_size = min(N_FRAMES, content_frames - seek)
         window = mel[:, seek : seek + segment_size]
         if segment_size < N_FRAMES:
             window = np.pad(window, ((0, 0), (0, N_FRAMES - segment_size)))
         result = decode(window, all_tokens[prompt_reset_since:].copy())
+        window_start = seek * HOP_SIZE / SAMPLE_RATE
+        window_end = (seek + segment_size) * HOP_SIZE / SAMPLE_RATE
+        metadata = window_metadata(result.metadata, window_index, window_start, window_end)
         tokens = result.tokens
         next_seek = seek + segment_size
         skip_silence = should_skip_window(
@@ -165,13 +184,31 @@ def transcribe_mel(
                     )
                     previous = cut
                 if not single_timestamp_ending:
-                    next_seek = seek + (tokens[previous - 1] - timestamp_begin) * stride
+                    if result.rejected:
+                        tail = tokens[previous:]
+                        if tail:
+                            pieces.append(
+                                (
+                                    offset + (tail[0] - timestamp_begin) * precision,
+                                    offset + segment_size * HOP_SIZE / SAMPLE_RATE,
+                                    tail,
+                                )
+                            )
+                    else:
+                        next_seek = seek + (tokens[previous - 1] - timestamp_begin) * stride
             else:
                 duration = segment_size * HOP_SIZE / SAMPLE_RATE
                 timestamps = [token for token in tokens if token >= timestamp_begin]
-                if timestamps and timestamps[-1] != timestamp_begin:
+                if (
+                    timestamps
+                    and timestamps[-1] != timestamp_begin
+                    and (not result.rejected or timestamp_flags[-1])
+                ):
                     duration = (timestamps[-1] - timestamp_begin) * precision
-                pieces.append((offset, offset + duration, tokens))
+                start = offset
+                if result.rejected and timestamp_flags and timestamp_flags[0]:
+                    start += (tokens[0] - timestamp_begin) * precision
+                pieces.append((start, offset + duration, tokens))
 
             for start, end, piece in pieces:
                 segment_text = text([token for token in piece if token < eot])
@@ -181,17 +218,32 @@ def transcribe_mel(
                     kept_tokens = []
                 segments.append(TimedSegment(start, end, segment_text))
                 if segment_trace is not None:
-                    segment_trace(SegmentTrace(start, end, segment_text, kept_tokens, seek))
+                    segment_trace(
+                        SegmentTrace(
+                            start,
+                            end,
+                            segment_text,
+                            kept_tokens,
+                            seek,
+                            metadata if segment_text else (),
+                        )
+                    )
+                if segment_text:
+                    metadata = ()
                 all_tokens.extend(kept_tokens)
 
             if result.temperature > 0.5:
                 prompt_reset_since = len(all_tokens)
+
+        if metadata and segment_trace is not None:
+            segment_trace(SegmentTrace(window_start, window_end, "", [], seek, metadata))
 
         if trace is not None:
             trace(WindowTrace(seek, next_seek, list(tokens)))
         if next_seek <= seek:
             raise RuntimeError("decoded timestamp did not advance the audio window")
         seek = next_seek
+        window_index += 1
     return LongTranscription(
         text([token for token in all_tokens[initial_prompt_length:] if token < eot]), segments
     )
