@@ -528,9 +528,7 @@ asyncio.run(run())
                 if precision != "fp16" and damage in ("missing-plugin", "plugin-version"):
                     continue
                 for target in files:
-                    unchanged = {
-                        path: _engine_identity(path) for path in files if path != target
-                    }
+                    unchanged = {path: _engine_identity(path) for path in files if path != target}
                     if damage == "corrupt":
                         target.write_bytes(b"truncated")
                     elif damage == "incompatible":
