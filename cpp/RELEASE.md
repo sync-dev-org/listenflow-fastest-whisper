@@ -1,86 +1,134 @@
 # Build and inspect a Linux release wheel
 
-Follow [tensoracle's repository guide, sections 5–6](https://sync-dev-org.github.io/tensoracle/cpp-python-repositories/).
-The release target is Linux x86_64, Python 3.12–3.13, and glibc 2.28 or later.
-The plugin does not use the Python C API, so the inspected wheel uses
-`py3-none-manylinux_2_28_x86_64`. CUDA 13 driver support and the declared
-`tensorrt-cu13` dependency are additional runtime requirements.
+The release target is Linux x86_64 (including WSL2), Python 3.12–3.13, and
+glibc 2.28 or later. The wheel tag is
+`cp312-abi3-manylinux_2_28_x86_64`. Its native files are
+`listenflow/fastest_whisper/liblffw_runtime.so`, `_native.abi3.so`, and
+`liblffw_fc1_plugin.so`. The plugin embeds nine cubins for sm86, sm89 and sm120.
+The wheel reads `libtensoracle.so.2` from the declared tensoracle dependency's
+wheel. The host supplies the NVIDIA driver and TensorRT runtime; see the
+[installation instructions](https://github.com/sync-dev-org/listenflow-fastest-whisper#install)
+for their minimum versions and the TensorRT apt packages.
 
-Prepare the verified SDK and locked NVIDIA PyPI packages using [README.md](README.md).
-Keep host CMake, Ninja, binutils, Docker, and uv available. Use a clean release
-commit bearing the exact version tag. The Python backend preserves that version
-in the source archive. Untagged commits use `0.0.0.dev0` for development checks.
+Keep host CMake, Ninja, binutils, Docker, uv and the pinned Conan CLI available.
+`python/pyproject.toml` pins Conan's version in `[build-system].requires`.
+The host's `gh` authentication must be able to read `sync-dev-org/conan-recipes`.
+Use a clean release commit bearing its exact version tag. Untagged commits use
+`0.0.0.dev0` for development checks. The source archive preserves that version.
+The source archive is an internal build input: publish only the inspected wheel.
 
-From `python/`, with `TENSORRT_ROOT` naming the verified SDK:
+Prepare the Python tools from `python/`:
 
 ```bash
-uv sync --group cubin --locked
-bash ../cpp/build_manylinux_wheel.sh ../dist/release
+uv sync --no-install-project --group cubin --locked
 ```
 
-The output directory must be new. The script produces the cubin bundle without
-a GPU, builds the source archive, and compiles that archive inside the exact
-manylinux image recorded in `manylinux-image.txt`. It mounts the SDK, PyPI CUDA
-headers, NVIDIA driver link library, and installed tensoracle C++ helper
-read-only. It does not mount GPU devices or
-depend on another repository. The container supplies CMake and GNU Make; the
-script does not install CMake or Ninja into the Python environment.
-The script removes each container after execution. Remove the image when its
-verification is complete if the development host needs the disk space.
+Check the host's free space and the image reference in `cpp/manylinux-image.txt`.
+Pull that exact digest if it is absent, coordinating the download and disk space
+with other users of the host. The build script uses the already installed image
+and does not pull, replace or remove images. From the repository root:
 
-The CUDA header root defaults to the installed `nvidia-cuda-runtime` package's
-`nvidia/cu13` directory; `CUDAToolkit_ROOT` can override it. The script finds
-`libcuda.so.1` under `/usr/lib/wsl/lib` or through the native Linux loader's
-cache. Set `LFFW_CUDA_DRIVER_LIBRARY` to its absolute path for another location.
-The container receives only `include/` and the driver library at `/cuda`; no OS
-toolkit or GPU device is needed. The driver remains external to the final wheel.
+```bash
+bash cpp/build_manylinux_wheel.sh dist/release
+```
 
-The output directory records the source revision and patch, complete archive
-source manifest, image manifest/configuration digests and architecture, locked
-Python dependencies, hash-pinned build dependencies, SDK and driver checksums, bundle
-digest, compiler/linker/CMake/Make/Python/CUDA/backend versions, build log,
-artifact hashes, disk measurements, and raw and final ELF/auditwheel reports.
-The CMake settings are Release, `BUILD_TESTING=OFF`, Unix Makefiles, two build
-jobs, and the four explicit build-input roots in `build_manylinux_wheel.sh`.
-Archive these records with the runtime verification results for every release.
+The output directory must be new. The script obtains and verifies the recipe
+archive through `cpp/conan/fetch_recipe.py`. That host-only child reads the
+host's `gh` token and places it in a temporary Conan `source_credentials.json`
+under `/tmp`, deletes the credentials immediately after downloading, and
+withholds the child's diagnostics on failure. The archive URL and SHA256 have
+one definition in `cpp/conan/recipe-archive.json`. The script places the
+verified archive inside the internal sdist. The container receives that archive
+without credentials, and its bootstrap checks the SHA256 and each exported
+recipe's revision against `cpp/conan.lock`, even if recipes are already cached.
 
-Review `elf-header.txt`, `elf-versions.txt`, and `elf-dynamic.txt` for every
-shipped ELF. The wheel must contain only the production fc1 library as native
-code, with ELF64 x86-64 architecture. Compare symbol versions numerically with
-the intended baseline. There must be no absolute SDK or build-machine RPATH or
-RUNPATH. `check_plugin.cmake` also checks registration exports and direct
-dependencies. The tensoracle inspector compares the embedded bytes and digest
-with all nine cubins, including fc1 for sm86, sm89, and sm120.
+Host cubin generation uses `generate_cubin_bundle.py --cuda-root` with the
+Conan-provided CUDA redist root. Only that producer command receives the
+toolkit's `lib` directory in `LD_LIBRARY_PATH` so NVRTC finds its builtins.
+The container obtains tensoracle's prebuilt
+SDK, TensorRT's SDK and CUDA's redist components through the same consumer
+recipe and lock. It does not mount host TensorRT or CUDA SDKs or use a PyPI
+wheel as the C++ SDK. It mounts only the internal source archive, generated
+bundle, build script, output directory and host driver link library. GPU
+devices are not exposed.
 
-`auditwheel repair` excludes `libcuda.so.1` (the NVIDIA driver) and
-`libnvinfer.so.11` (the declared TensorRT dependency). Never copy either into
-this wheel, and never ship link-time stubs. These exclusions alone do not
-establish compatibility. `auditwheel show` still reports external NVIDIA
-libraries and can describe the wheel as `linux_x86_64`; retain that report.
-The plugin links `Threads::Threads` for tensoracle's mutexes. On glibc 2.28,
-retain the direct `libpthread.so.0` dependency and check its versioned pthread
-references; a successful shared-library link alone does not prove resolution.
-Check the plugin's versioned symbols separately and verify that the declared
-TensorRT wheel and host driver resolve its external dependencies at runtime.
-Keep the final `py3-none-manylinux_2_28_x86_64` tag only when these checks pass.
+The fixed image supplies GCC 14.2.1, GNU Make and CMake. The release profile is
+`cpp/conan/profiles/manylinux-gcc-toolset-14`, with `cuda-toolkit/*:mode=redist`
+and system CMake replacing Conan's CMake tool dependency. `LFFW_RELEASE_BUILD=1`
+selects this profile and `conan install '--build=*'`. The container obtains the
+pinned Conan CLI and other build tools from hash-pinned resolutions of
+`[build-system].requires`. It uses two CPU jobs, a 16 GiB RAM limit, Release,
+Unix Makefiles and `BUILD_TESTING=OFF`. Its new, writable `CONAN_HOME` and
+package storage live under `/tmp`. Git discovery is disabled while building
+the extracted sdist. The container is removed after execution. The script
+samples root-disk space every five seconds and stops the container below
+10 GiB free. It removes its host staging directory on success or failure.
+If the build or verification fails, it removes the unverified `final/` candidates
+and preserves the failure status and diagnostic records.
 
-Create separate temporary Python 3.12 and 3.13 environments, install the final
-wheel with its declared dependencies, and run outside the source tree. Remove
-SDK, producer, source `PYTHONPATH`, custom library paths, and toolkit environment
-variables from the runtime process. The package must import and load its own
-fc1 library. After coordinating shared GPU use, use
-`python/tests/wheel_runtime.py` with the independent interpreter's `-I` option,
-a local large-v3 checkpoint, and the small-boat and silence WAVs. Pass
-`--checkpoint PATH --audio PATH --audio PATH`. Save its JSON output, then start
-a new process with the same cache and `--reuse --expect FIRST_RESULT.json`.
-The probe checks preparation, streaming, fp16 token sequences, unchanged saved
-engine inodes and SHA-256 hashes, and the absence of producer imports. Compare
-`observed` with the development build's result as well. A separate CUDA-driver
-observer can verify fc1 launches and the selected SM without changing the plugin.
+The output directory retains:
 
-Retain installed dependency versions, GPU/driver/runtime versions, test commands,
-elapsed times, and disk measurements with the build records. Run the existing
-fc1 correctness and engine-cache recovery GPU tests with tensoracle 1.6.0. Record
-sm86 and sm89 as build/inspection coverage when those GPUs are unavailable.
-Check artifact size against the current upload limit before publication. These
-commands build and inspect artifacts; publication is a separate action.
+- Source revision, patch, extracted-source SHA256 manifest, source version and
+  source-archive hash; Python lock and hash-pinned build requirements.
+- Image reference, manifest digest, configuration digest and architecture;
+  container configuration, exit code, build log and disk measurements.
+- Compiler, linker, CMake, Make, Python, Conan, CUDA compiler, backend and
+  installed build-package versions; Conan profile, lock, resolved graph,
+  toolchain, install log, recipe archive hash and exported recipe revisions.
+- Driver checksum, bundle manifest and digest, nine-cubin comparison result,
+  plugin export/dependency check, raw/final `auditwheel show` reports, final
+  wheel hash, member list and reports for every ELF.
+
+`inspect_release_wheel.py` checks ELF64 x86-64, the exact wheel tag and native
+file set, and records each ELF's `NEEDED`, `RPATH`, `RUNPATH` and maximum
+`GLIBC_*`, `GLIBCXX_*`, `CXXABI_*` versions. It compares numeric components
+against 2.28, 3.4.25 and 1.3.11 respectively. The inference library's sole
+RUNPATH must be `$ORIGIN/../../tensoracle/cpp/lib`; the extension uses
+`$ORIGIN`, and the plugin has no search path. Absolute build/Conan paths and
+TensorRT paths must not appear. `NEEDED` must not contain `libcudart.so`.
+`auditwheel repair` excludes `libtensoracle.so.2`, `libnvinfer.so.11` and
+`libcuda.so.1`. Never bundle them or driver stubs. The exclusions require
+separate runtime verification; retain auditwheel's external-library report.
+The tensoracle bundle inspector compares the plugin's embedded bytes and
+digest with all nine original cubins. `check_plugin.cmake` checks exports and
+direct dependencies.
+
+After the container finishes, create separate temporary Python 3.12 and 3.13
+environments outside the records directory. Install the final wheel with its
+declared dependencies and run outside the source tree with `python -I`.
+Remove build/toolkit variables, source `PYTHONPATH` and custom library paths.
+Import the package and its native extension and inspect `/proc/self/maps`:
+exactly one resolved `libtensoracle.so.2` must come from that environment's
+`site-packages/tensoracle/cpp/lib`. Save installed versions, commands and
+results. Verify the runtime dependency lower bound against the SDK version.
+On a verification host without apt's TensorRT runtime, obtain the host
+operator's decision before installing the TensorRT wheel in the verification
+environment through tensoracle's `tensorrt` extra (`tensoracle[tensorrt]`).
+Set `LD_LIBRARY_PATH` to that environment's `site-packages/tensorrt_libs`
+directory alone. Keep `PYTHONPATH`, SDK variables
+and all other library paths unset. Verify that tensoracle still resolves from
+the wheel's RUNPATH. Record the exact `LD_LIBRARY_PATH` string and that native
+import without this explicit path was not verified on that host. This setup
+checks import and GPU operation with the specified TensorRT loader path; it
+does not change the package's host-runtime requirement or wheel RUNPATH.
+
+Coordinate sm120 GPU use before running representative large-v3 fp16 and fp8
+tests with the installed wheel. `python/tests/wheel_runtime.py` accepts
+`--precision fp16` or `--precision fp8`, `--checkpoint PATH`, and repeated
+`--audio PATH` arguments for the small-boat and silence WAVs. Run it with the
+independent interpreter's `-I` option. Set `XDG_CACHE_HOME` to a temporary
+engine-cache directory outside the records. Save its JSON result; a fresh
+process with the same cache, `--reuse --expect FIRST_RESULT.json`, checks
+unchanged engine inodes/hashes and identical tokens and transcripts. The probe
+also rejects producer/torch/triton imports. Keep each run within the agreed GPU,
+RAM, time and disk limits and record disk space before and after each run.
+Remove its engine cache after the command. sm86 and sm89 receive build and
+inspection coverage; GPU measurements use sm120.
+
+Run the Release and standalone C++ CPU CTests (`ctest ... -LE gpu`) and the
+Python CPU suite without skips. Retain their results along with the independent
+Python and GPU checks. Delete verification environments, source copies, engine
+caches and other intermediates after use. Measure the records directory before
+copying it; it must contain records and the final wheel, without venvs or
+`hosts/runs/` execution environments. Check the wheel's size and restricted
+terms before publication. Release publication is performed separately.

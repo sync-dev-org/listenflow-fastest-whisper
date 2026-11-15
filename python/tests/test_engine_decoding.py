@@ -45,9 +45,6 @@ def _engine(tmp_path, **options):
 @pytest.fixture
 def runtime(monkeypatch):
     from listenflow.fastest_whisper import _cached_model
-    from listenflow.fastest_whisper import _engine as engine_module
-
-    monkeypatch.setattr(engine_module, "_cuda_device_info", lambda _device: (1, (12, 0)))
 
     def install(
         *,

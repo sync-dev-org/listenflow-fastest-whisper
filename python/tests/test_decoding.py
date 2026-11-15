@@ -33,6 +33,12 @@ class _NativeMel:
     def close(self):
         pass
 
+    def mel(self, audio):
+        return SimpleNamespace(close=lambda: None)
+
+    def log_mel_block(self, audio):
+        return self.run({"audio": audio}, device_outputs=())["log_mel"]
+
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-002")
 def test_beam_keeps_two_live_paths_until_completion():
@@ -461,7 +467,7 @@ def test_short_entries_accept_beam_and_retry_settings_without_loading_a_gpu(entr
 
     class Model(TensorRTWhisper):
         config = SimpleNamespace(n_mels=128)
-        _mel = _NativeMel()
+        _native_model = _NativeMel()
 
         def __init__(self):
             pass
@@ -517,7 +523,7 @@ def test_long_entry_applies_settings_with_hint_to_its_decoded_window(monkeypatch
 
     class Model(TensorRTWhisper):
         config = SimpleNamespace(n_mels=128, audio_positions=1_500)
-        _mel = _NativeMel()
+        _native_model = _NativeMel()
 
         def __init__(self):
             pass
@@ -566,7 +572,7 @@ def test_cached_runtime_accepts_beam_settings_for_short_audio():
     model = CachedWhisper.__new__(CachedWhisper)
     model.tokenizer = Tokenizer(models.WordLevel({"<|en|>": 2}))
     model.initial_tokens = [1, 2, 3, 4]
-    model._mel = _NativeMel()
+    model._native_model = _NativeMel()
     model.config = SimpleNamespace(n_mels=128)
     model.prompt_tokens = lambda hint: [42] if hint else []
     model.encode = lambda _mel: np.empty((0,), dtype=np.float32)
@@ -594,7 +600,7 @@ def test_cached_runtime_omits_best_of_as_five_samples():
     model = CachedWhisper.__new__(CachedWhisper)
     model.tokenizer = Tokenizer(models.WordLevel({"<|en|>": 2}))
     model.initial_tokens = [1, 2, 3, 4]
-    model._mel = _NativeMel()
+    model._native_model = _NativeMel()
     model.config = SimpleNamespace(n_mels=128)
     model.prompt_tokens = lambda _hint: []
     model.encode = lambda _mel: np.empty((0,), dtype=np.float32)

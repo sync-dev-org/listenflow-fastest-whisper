@@ -33,13 +33,18 @@ def test_fp8_is_an_explicit_precision_and_unknown_values_are_rejected(tmp_path):
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-013")
 @pytest.mark.req("SP-LFFASTESTWHISPER-019")
-def test_prepare_rejects_fp8_on_sm86_before_loading_or_warming(tmp_path, monkeypatch):
-    """sm86 preparation reports unsupported fp8 and offers fp16/fp32 without loading engines."""
-    from listenflow.fastest_whisper import _engine
+def test_prepare_reports_native_fp8_on_sm86_without_warming(tmp_path, monkeypatch):
+    """The native capability failure preserves precision and maps to the public environment error."""
+    from listenflow.fastest_whisper._native import NativeError
 
-    monkeypatch.setattr(_engine, "_cuda_device_info", lambda device: (1, (8, 6)))
     selected = engine(tmp_path)
-    monkeypatch.setattr(selected, "_load_model", lambda: pytest.fail("must not build on sm86"))
+
+    def unsupported():
+        error = NativeError("fp8 is unsupported on sm86; select fp32 or fp16")
+        error.status = 9
+        raise error
+
+    monkeypatch.setattr(selected, "_load_model", unsupported)
     with pytest.raises(EnvironmentUnavailableError, match="fp8") as failure:
         asyncio.run(selected.prepare())
     assert "fp16" in str(failure.value) and "fp32" in str(failure.value)

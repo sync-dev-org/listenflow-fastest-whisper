@@ -1,11 +1,7 @@
 """Load the required fc1 implementation shipped inside the Python package."""
 
-import ctypes
 from importlib.resources import files
 from pathlib import Path
-
-import numpy as np
-import tensorrt as trt
 
 
 def _fc1_library() -> Path:
@@ -27,6 +23,11 @@ def _fc1_library() -> Path:
 
 
 def _fc1_plugin():
+    import ctypes
+
+    import numpy as np
+    import tensorrt as trt
+
     # open_engine registers and retains this library before invoking the graph.
     library = ctypes.CDLL(str(_fc1_library()))
     digest = (ctypes.c_char * 65).in_dll(library, "tensoracle_bundle_sha256").value

@@ -1,13 +1,12 @@
 """E4M3 linear operands with fp16 surrounding operations for product fp8."""
 
-from pathlib import Path
-
 import numpy as np
 import tensorrt as trt
 
+from ._assets import FP8_SCALES
 from ._network import _Graph
 
-_SCALES = Path(__file__).parent / "assets" / "fp8-scales.json"
+_SCALES = FP8_SCALES
 _GRAPH_VERSION = "fp8-1"
 
 

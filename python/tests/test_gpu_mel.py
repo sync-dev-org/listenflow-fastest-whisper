@@ -2,12 +2,13 @@
 
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import tensorrt as trt
 from scripts.generate_oracle import read_pcm16_mono
+
+from test_native_resources import native_boundary as native_boundary  # noqa: PLC0414
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -117,66 +118,36 @@ def test_gpu_mel_graph_math_preserves_official_features(name):
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-008")
-def test_mel_engine_cache_identifies_configuration_precision_and_filters(tmp_path, monkeypatch):
-    """The mel build retains saved engines with the declared identity and fp32 arithmetic."""
-    from listenflow.fastest_whisper import _engines
+def test_mel_native_input_is_separate_from_model_weights(source_checkpoint, native_boundary):
+    """Native mel uses the checked filter asset instead of treating auxiliary JSON/NPZ as weights."""
+    from listenflow.fastest_whisper._audio import _FILTERS
+    from listenflow.fastest_whisper._cached_model import CachedWhisper
 
-    calls = []
-
-    def open_native(graph, declaration, **kwargs):
-        network = NativeNetwork(np.zeros(480_400, dtype=np.float32))
-        graph(network)
-        calls.append((declaration, kwargs))
-        return object()
-
-    monkeypatch.setattr(_engines, "open_engine", open_native)
-    checkpoint = SimpleNamespace(directory=tmp_path, config=SimpleNamespace(n_mels=128))
-    for precision in ("fp16", "fp32"):
-        _engines._open_mel_engine(
-            checkpoint,
-            precision=precision,
-            logger=trt.Logger(trt.Logger.ERROR),
-        )
-    assert all(not declaration.settings.tf32 for declaration, _ in calls)
-    assert all(not entry.get("force_rebuild", False) for _, entry in calls)
-    assert calls[0][1]["graph_version"] != calls[1][1]["graph_version"]
-    assert all(entry["weights"][0] == tmp_path / "config.json" for _, entry in calls)
-    assert all(entry["weights"][1].name == "mel_filters.npz" for _, entry in calls)
-    assert all(entry["io"].outputs["mel"].dtype == trt.float32 for _, entry in calls)
-    assert all(entry["io"].outputs["mel"].shape == (128, 3000) for _, entry in calls)
+    calls, _ = native_boundary
+    with CachedWhisper(source_checkpoint):
+        pass
+    source = calls[0][0]
+    assert source["mel_filter_file"] == str(_FILTERS)
+    assert source["mel_weights"] == str(_FILTERS.with_suffix(".safetensors"))
+    assert source["mel_weights"] not in source["weights"]
+    assert all(path.endswith(".safetensors") for path in source["weights"])
 
 
 @pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-002")
 @pytest.mark.parametrize("name", ["small_boat_16khz_mono_s16le", "silence_16khz_mono_s16le"])
 def test_native_gpu_mel_matches_official_fp32_features(name):
-    """The native TensorRT mel engine keeps official fp32 features on the device."""
+    """The native model returns mel values matching the official FP32 feature oracle."""
     checkpoint = os.environ.get("LFFW_CHECKPOINT_DIR")
     if os.environ.get("LFFW_USE_GPU") != "1" or not checkpoint:
         pytest.skip("set LFFW_USE_GPU=1 and LFFW_CHECKPOINT_DIR for GPU comparisons")
-    from listenflow.fastest_whisper._checkpoint import Checkpoint
-    from listenflow.fastest_whisper._engines import _open_mel_engine
-    from listenflow.fastest_whisper._inference import _HostIO
+    from listenflow.fastest_whisper._inference import TensorRTWhisper
 
-    with Checkpoint(Path(checkpoint)) as weights:
-        handle = _open_mel_engine(weights, precision="fp16", logger=trt.Logger(trt.Logger.ERROR))
     samples = read_pcm16_mono(FIXTURES / f"{name}.wav")
-    io = _HostIO(handle)
-    try:
-        result = io.run(
-            {
-                "audio": np.pad(
-                    np.pad(samples, (0, 480_000 - samples.size)), (200, 200), mode="reflect"
-                )
-            },
-            device_outputs=("mel", "log_mel"),
-        )
+    with TensorRTWhisper(Path(checkpoint)) as model:
+        actual = np.asarray(model._mel_spectrogram(samples))[0]
         with np.load(FIXTURES / "oracle" / f"{name}.npz") as oracle:
-            np.testing.assert_allclose(result["mel"].numpy(), oracle["mel"], atol=3e-5, rtol=3e-5)
-        result["mel"].close()
-        result["log_mel"].close()
-    finally:
-        io.close()
+            np.testing.assert_allclose(actual, oracle["mel"], atol=3e-5, rtol=3e-5)
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-002")
@@ -193,13 +164,16 @@ def test_long_gpu_features_keep_cross_window_samples_and_global_clipping():
             graph.define()
             return network.outputs
 
+        def log_mel_block(self, centered):
+            return self.run({"audio": centered}, device_outputs=())["log_mel"]
+
         def close(self):
             pass
 
     samples = read_pcm16_mono(FIXTURES / "small_boat_16khz_mono_s16le.wav")
     waveform = np.concatenate((samples, samples * np.float32(0.001), samples))
     model = TensorRTWhisper.__new__(TensorRTWhisper)
-    model._mel = NativeMelIO()
+    model._native_model = NativeMelIO()
     expected = log_mel_spectrogram_long(waveform, n_mels=128)
     actual = model._mel_spectrogram_long(waveform)
     np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-5)

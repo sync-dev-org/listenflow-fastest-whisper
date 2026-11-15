@@ -1,3 +1,5 @@
 src/listenflow/fastest_whisper/_version.py
 # Exclude real and symlinked virtual environments from source distributions.
 .venv
+# Native development installs from python/CMakeLists.txt.
+/src/listenflow/fastest_whisper/*.so

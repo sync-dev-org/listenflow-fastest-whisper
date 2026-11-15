@@ -1,15 +1,12 @@
 """Behavior checks for the fp16 latency breakdown without a CUDA GPU."""
 
 import csv
-import ctypes
 import json
-import sys
-from pathlib import Path
-from types import SimpleNamespace
 
-import numpy as np
 import pytest
 from scripts import profile_latency
+
+pytest_plugins = ("test_native_failures",)
 
 
 def _row(name, seconds, subset="test-clean"):
@@ -131,493 +128,146 @@ def test_profile_rejects_missing_gpu_steps_and_invalid_durations():
 
 
 @pytest.fixture
-def cpu_native(monkeypatch):
-    """Keep real Whisper and tensoracle objects, replacing only CUDA/TensorRT operations."""
-    import tensorrt as trt
-    from cuda.bindings import runtime as cudart
-    from tensoracle import EngineHandle
-    from tokenizers import Tokenizer, models
+def cpu_native(fault_observer, source_checkpoint):
+    """Use real native execution with deterministic external device operations."""
+    from diagnostic_runtime_fixture import DiagnosticRuntime
 
-    from listenflow.fastest_whisper._inference import TensorRTWhisper, _HostIO
-
-    clock = SimpleNamespace(seconds=0.0)
-    allocations, events, trace = {}, {}, []
-    completion_events = {}
-    host_allocations = {}
-    transfers = []
-    graph_state = SimpleNamespace(capture=None, executables={}, captures=0, next_id=1)
-    success = cudart.cudaError_t.cudaSuccess
-
-    def allocate(size):
-        block = ctypes.create_string_buffer(size)
-        pointer = ctypes.addressof(block)
-        allocations[pointer] = block
-        clock.seconds += 0.0005
-        return success, pointer
-
-    def free(pointer):
-        del allocations[pointer]
-        clock.seconds += 0.0005
-        return (success,)
-
-    def allocate_host(size):
-        block = ctypes.create_string_buffer(size)
-        pointer = ctypes.addressof(block)
-        host_allocations[pointer] = block
-        return success, pointer
-
-    def free_host(pointer):
-        del host_allocations[pointer]
-        return (success,)
-
-    def copy(destination, source, size, kind, stream):
-        transfers.append((kind, size))
-        ctypes.memmove(destination, source, size)
-        clock.seconds += 0.001
-        return (success,)
-
-    def copy2d(destination, dpitch, source, spitch, width, height, kind, stream):
-        for row in range(height):
-            ctypes.memmove(destination + row * dpitch, source + row * spitch, width)
-        return (success,)
-
-    monkeypatch.setattr(cudart, "cudaMemcpy2DAsync", copy2d)
-    monkeypatch.setattr(
-        cudart,
-        "cudaMemsetAsync",
-        lambda pointer, value, size, stream: (ctypes.memset(pointer, value, size), (success,))[1],
-    )
-
-    def create_event():
-        event = len(events) + 100
-        events[event] = None
-        return success, event
-
-    def record(event, stream):
-        if event in completion_events:
-            completion_events[event] = clock.seconds
-            return (success,)
-        events[event] = clock.seconds
-        trace.append(("event", stream))
-        return (success,)
-
-    def elapsed(start, stop):
-        assert events[start] is not None and events[stop] is not None
-        return success, (events[stop] - events[start]) * 1000
-
-    def destroy(event):
-        if event in completion_events:
-            del completion_events[event]
-        else:
-            del events[event]
-        return (success,)
-
-    def create_completion(flags):
-        event = -len(completion_events) - 1
-        completion_events[event] = None
-        return success, event
-
-    for name in (
-        "cudaSetDevice",
-        "cudaStreamSynchronize",
-        "cudaStreamDestroy",
-        "cudaDeviceSynchronize",
-    ):
-        monkeypatch.setattr(cudart, name, lambda *args: (success,))
-    monkeypatch.setattr(cudart, "cudaStreamCreate", lambda: (success, 42))
-    for name, callback in (
-        ("cudaMalloc", allocate),
-        ("cudaFree", free),
-        ("cudaMallocHost", allocate_host),
-        ("cudaFreeHost", free_host),
-        ("cudaMemcpyAsync", copy),
-        ("cudaEventCreate", create_event),
-        ("cudaEventCreateWithFlags", create_completion),
-        ("cudaEventRecord", record),
-        ("cudaEventQuery", lambda event: (success,)),
-        ("cudaEventElapsedTime", elapsed),
-        ("cudaEventDestroy", destroy),
-    ):
-        monkeypatch.setattr(cudart, name, callback)
-
-    def begin_capture(stream, mode):
-        assert graph_state.capture is None
-        graph_state.capture = []
-        graph_state.captures += 1
-        return (success,)
-
-    def end_capture(stream):
-        graph = tuple(graph_state.capture)
-        graph_state.capture = None
-        return success, graph
-
-    def instantiate(graph, flags):
-        identifier = graph_state.next_id
-        graph_state.next_id += 1
-        graph_state.executables[identifier] = graph
-        return success, identifier
-
-    def launch(identifier, stream):
-        for operation in graph_state.executables[identifier]:
-            operation(stream)
-        return (success,)
-
-    def destroy_graph(identifier):
-        del graph_state.executables[identifier]
-        return (success,)
-
-    monkeypatch.setattr(cudart, "cudaStreamBeginCapture", begin_capture)
-    monkeypatch.setattr(cudart, "cudaStreamEndCapture", end_capture)
-    monkeypatch.setattr(cudart, "cudaGraphInstantiate", instantiate)
-    monkeypatch.setattr(cudart, "cudaGraphLaunch", launch)
-    monkeypatch.setattr(cudart, "cudaGraphDestroy", lambda graph: (success,))
-    monkeypatch.setattr(cudart, "cudaGraphExecDestroy", destroy_graph)
-
-    class Engine:
-        def __init__(self, decoder):
-            self.decoder = decoder is True
-            self.mel = decoder == "mel"
-            self.names = (
-                ("audio", "log_mel", "mel")
-                if self.mel
-                else (
-                    "tokens",
-                    "positions",
-                    "mask",
-                    "self_keys",
-                    "self_values",
-                    "cross_keys",
-                    "cross_values",
-                    "suppression",
-                    "logits",
-                    "token",
-                    "greedy",
-                    "present_keys",
-                    "present_values",
-                )
-                if self.decoder
-                else ("mel", "encoder", "cross_keys", "cross_values")
-            )
-            self.num_io_tensors = len(self.names)
-
-        def get_tensor_name(self, index):
-            return self.names[index]
-
-        def get_tensor_location(self, name):
-            return trt.TensorLocation.DEVICE
-
-        def get_tensor_mode(self, name):
-            outputs = (
-                ("log_mel", "mel")
-                if self.mel
-                else ("logits", "token", "greedy", "present_keys", "present_values")
-                if self.decoder
-                else ("encoder", "cross_keys", "cross_values")
-            )
-            return trt.TensorIOMode.OUTPUT if name in outputs else trt.TensorIOMode.INPUT
-
-        def is_shape_inference_io(self, name):
-            return False
-
-        def get_tensor_dtype(self, name):
-            if name in ("tokens", "positions", "token"):
-                return trt.int32
-            if self.mel:
-                return trt.float32
-            return trt.float32 if name in ("mel", "mask", "suppression", "greedy") else trt.float16
-
-        def get_tensor_shape(self, name):
-            return {
-                "audio": (480_400,),
-                "log_mel": (128, 3000),
-                "mel": (128, 3000) if self.mel else (1, 128, 3000),
-                "encoder": (1, 1, 2),
-                "tokens": (1, 1),
-                "positions": (1, 1),
-                "mask": (1, 1, 1, -1),
-                "self_keys": (1, 1, 1, -1, 2),
-                "self_values": (1, 1, 1, -1, 2),
-                "cross_keys": (1, 1, 1, 1, 2),
-                "cross_values": (1, 1, 1, 1, 2),
-                "present_keys": (1, 1, 1, -1, 2),
-                "present_values": (1, 1, 1, -1, 2),
-                "logits": (1, 1, 12),
-                "token": (1, 1, 1),
-                "greedy": (1, 1, 3),
-                "suppression": (1, 1, 12),
-            }[name]
-
-        def get_tensor_profile_shape(self, name, index):
-            if name == "mask":
-                return (1, 1, 1, 2), (1, 1, 1, 5), (1, 1, 1, 9)
-            return (1, 1, 1, 1, 2), (1, 1, 1, 4, 2), (1, 1, 1, 8, 2)
-
-        def create_execution_context(self):
-            return Context(self)
-
-    class Context:
-        def __init__(self, engine):
-            self.engine, self.shapes, self.addresses = engine, {}, {}
-
-        def set_input_shape(self, name, shape):
-            self.shapes[name] = shape
-            return True
-
-        def infer_shapes(self):
-            return []
-
-        def get_tensor_shape(self, name):
-            if name in ("present_keys", "present_values"):
-                shape = list(self.shapes["self_keys"])
-                shape[3] += 1
-                return tuple(shape)
-            return self.shapes.get(name, self.engine.get_tensor_shape(name))
-
-        def set_tensor_address(self, name, pointer):
-            self.addresses[name] = pointer
-            return True
-
-        def execute_async_v3(self, stream):
-            if graph_state.capture is not None:
-                graph_state.capture.append(self.perform)
-                return True
-            return self.perform(stream)
-
-        def perform(self, stream):
-            trace.append(("enqueue", stream))
-            clock.seconds += 0.002
-            for name in self.engine.names:
-                if self.engine.get_tensor_mode(name) != trt.TensorIOMode.OUTPUT:
-                    continue
-                output = np.zeros(
-                    self.get_tensor_shape(name),
-                    dtype=trt.nptype(self.engine.get_tensor_dtype(name)),
-                )
-                if name == "logits":
-                    position = ctypes.c_int.from_address(self.addresses["positions"]).value
-                    output[..., 8 if position < 4 else model.eot] = 10
-                if name in ("token", "greedy"):
-                    position = ctypes.c_int.from_address(self.addresses["positions"]).value
-                    scores = np.zeros(12, dtype=np.float32)
-                    scores[8 if position < 4 else model.eot] = 10
-                    suppression = np.ctypeslib.as_array(
-                        (ctypes.c_float * 12).from_address(self.addresses["suppression"])
-                    )
-                    token = np.argmax(scores + suppression)
-                    if name == "token":
-                        output[...] = token
-                    else:
-                        output[...] = [token, model._test_logprob, model._test_silence]
-                ctypes.memmove(self.addresses[name], output.ctypes.data, output.nbytes)
-            return True
-
-    model = TensorRTWhisper.__new__(TensorRTWhisper)
-    model.device = 0
-    model.precision = "fp16"
-    model.config = SimpleNamespace(
-        n_mels=128,
-        text_positions=8,
-        text_layers=1,
-        text_heads=1,
-        audio_state=2,
-        vocab_size=12,
-    )
-    model.initial_tokens, model.eot = [1, 2, 3, 4], 5
-    model.suppressed, model.begin_suppressed = {7}, {5}
-    model.tokenizer = Tokenizer(
-        models.WordLevel({"[UNK]": 0, "<|en|>": 2, "hello": 8}, unk_token="[UNK]")
-    )
-    model._encoder = _HostIO(EngineHandle(Engine(False), object(), Path("encoder.engine")))
-    model._decoder = _HostIO(EngineHandle(Engine(True), object(), Path("decoder.engine")))
-    model._test_transfers = transfers
-    model._test_logprob = -0.01
-    model._test_silence = 0.1
-    model._test_graph_state = graph_state
-    model._test_mel_factory = lambda: _HostIO(
-        EngineHandle(Engine("mel"), object(), Path("mel.engine"))
-    )
-    yield model, cudart, lambda: clock.seconds, events, trace
-    model.close()
-    assert not allocations
-    assert not host_allocations
-    assert not graph_state.executables
+    return DiagnosticRuntime(fault_observer, source_checkpoint)
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
 def test_profile_times_real_greedy_steps_and_brackets_enqueue_on_its_stream(cpu_native):
     """Timing preserves decoded text and counts EOT while separating GPU from host work."""
-    from tensoracle import EngineExecution
-
-    model, cudart, clock, events, trace = cpu_native
-    original = EngineExecution.enqueue
-    model.greedy_decode(model.encode(np.zeros((128, 3000), dtype=np.float32)))
-    trace.clear()
-    with profile_latency.DecoderProfiler(model, cudart, clock=clock) as profiler:
-        row = profiler.measure(_row("one", 1), np.zeros(16_000, dtype=np.float32))
-        second = profiler.measure(_row("two", 1), np.zeros(16_000, dtype=np.float32))
-        assert events
-
-    assert row["output"] == "hello"
-    assert row["tokens"] == [8, 5]
-    assert row["generated_tokens"] == len(row["decoder_steps"]) == 2
-    assert row["decoder_enqueues"] == 5
-    assert row["decoder_gpu_seconds"] == pytest.approx(0.010)
-    assert [step["gpu_seconds"] for step in row["decoder_steps"]] == pytest.approx([0.008, 0.002])
-    assert all(step["host_seconds"] > 0 for step in row["decoder_steps"])
-    assert second["decoder_gpu_seconds"] == pytest.approx(row["decoder_gpu_seconds"])
-    assert (
-        trace
-        == [
-            ("enqueue", 42),
-            *[("event", 42), ("enqueue", 42), ("event", 42)] * 5,
-        ]
-        * 2
-    )
-    assert EngineExecution.enqueue is original
-    assert "logits" not in model.__dict__
-    assert not events
-    profile_latency.summarize([row, second])
+    cpu_native.run("""
+with profile_latency.DecoderProfiler(model) as profiler:
+    row = profiler.measure({'id':'one', 'frames':'16000'}, waveform)
+    second = profiler.measure({'id':'two', 'frames':'16000'}, waveform)
+assert row['tokens'] == second['tokens'] == [1, 3]
+assert row['generated_tokens'] == len(row['decoder_steps']) == 2
+assert row['decoder_enqueues'] == 5
+assert row['decoder_gpu_seconds'] > 0
+assert [item['bucket'] for item in row['decoder_buckets']] == [1, 8, 8, 8, 8]
+assert row['decoder_gpu_seconds'] == sum(item['gpu_seconds'] for item in row['decoder_buckets'])
+profile_latency.summarize([row, second])
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
-def test_profile_restores_inference_and_destroys_events_after_failed_enqueue(
-    cpu_native, monkeypatch
-):
+def test_profile_restores_inference_and_destroys_events_after_failed_enqueue(cpu_native):
     """An enqueue error leaves no profiler hooks or CUDA events behind."""
-    from tensoracle import EngineExecution
-
-    model, cudart, clock, events, _ = cpu_native
-    original = EngineExecution.enqueue
-    context_type = type(model._decoder.execution._context)
-    execute = context_type.execute_async_v3
-    monkeypatch.setattr(
-        context_type,
-        "execute_async_v3",
-        lambda context, stream: False if context.engine.decoder else execute(context, stream),
-    )
-    with (
-        pytest.raises(RuntimeError, match="enqueue failed"),
-        profile_latency.DecoderProfiler(model, cudart, clock=clock) as profiler,
-    ):
-        profiler.measure(_row("one", 1), np.zeros(16_000, dtype=np.float32))
-    assert EngineExecution.enqueue is original
-    assert "logits" not in model.__dict__
-    assert not events
+    cpu_native.run("""
+original = model._greedy_step
+observer.lffw_test_fail_next(3)
+try:
+    with profile_latency.DecoderProfiler(model) as profiler:
+        profiler.measure({'id':'bad', 'frames':'16000'}, waveform)
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('enqueue failure ignored')
+assert model._greedy_step == original
+with diagnostic.Session(1) as next_session:
+    assert _native.abi_version() == (1, 0, 0)
+assert len(next_session.records) == 1
+next_session.close()
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
 def test_profile_measures_the_gpu_audio_features_used_by_inference(cpu_native):
     """The profile includes native mel execution when the model supplies its GPU audio path."""
-    model, cudart, clock, _, trace = cpu_native
-    model._mel = model._test_mel_factory()
-    model.greedy_decode(model.encode(model._mel_spectrogram(np.zeros(16_000, dtype=np.float32))))
-    trace.clear()
-    with profile_latency.DecoderProfiler(model, cudart, clock=clock) as profiler:
-        row = profiler.measure(_row("gpu-mel", 1), np.zeros(16_000, dtype=np.float32))
-    assert row["tokens"] == [8, 5]
-    assert sum(operation == "enqueue" for operation, _ in trace) == 7
-    assert row["decoder_enqueues"] == 5
-    assert row["mel_seconds"] > 0
+    cpu_native.run("""
+with profile_latency.DecoderProfiler(model) as profiler:
+    row = profiler.measure({'id':'mel', 'frames':'16000'}, waveform)
+assert row['tokens'] == [1, 3]
+assert any(item['name'] == 'lffw_mel_compute' for item in row['native_operations'])
+assert any(item['name'] == 'lffw_encode' for item in row['native_operations'])
+assert row['mel_seconds'] > 0 and row['encoder_seconds'] > 0
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
 def test_greedy_reads_only_the_selected_token_from_each_decoder_execution(cpu_native):
     """Greedy decoding preserves tokens while each GPU-to-host transfer contains one token ID."""
-    model, cudart, _, _, _ = cpu_native
-    encoder = model.encode(np.zeros((128, 3000), dtype=np.float32))
-    model._test_transfers.clear()
-    result = model.greedy_decode(encoder)
-    copied = [
-        size
-        for kind, size in model._test_transfers
-        if kind == cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost
-    ]
-    assert result.tokens == [8, 5]
-    assert copied == [4] * 5
+    cpu_native.run("""
+audio = model.encode(features)
+expected = model.greedy_decode(audio)
+with diagnostic.Session() as session:
+    actual = model.greedy_decode(audio)
+steps = [item for item in session.records if item['name'] == 'lffw_greedy_step']
+assert actual.tokens == expected.tokens == [1, 3]
+assert [span['bytes'] for item in steps for span in item['spans'] if span['phase']=='d2h'] == [4]*5
+session.close()
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
 def test_default_first_attempt_keeps_greedy_tokens_and_only_copies_scalar_results(cpu_native):
     """An accepted first attempt matches greedy and transfers no vocabulary-sized logits."""
-    from listenflow.fastest_whisper._decoding import DecodingSettings
-
-    model, cudart, _, _, _ = cpu_native
-    encoder = model.encode(np.zeros((128, 3000), dtype=np.float32))
-    expected = model.greedy_decode(encoder)
-    model._test_transfers.clear()
-    actual = model.decode_short(encoder, [], DecodingSettings())
-
-    assert actual == expected
-    copied = [
-        size
-        for kind, size in model._test_transfers
-        if kind == cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost
-    ]
-    assert copied == [12] * 5
+    cpu_native.run("""
+audio = model.encode(features)
+expected = model.greedy_decode(audio)
+with diagnostic.Session() as session:
+    actual = model.decode_short(audio, [], DecodingSettings())
+steps = [item for item in session.records if item['name'] == 'lffw_greedy_step']
+assert actual == expected
+assert [span['bytes'] for item in steps for span in item['spans'] if span['phase']=='d2h'] == [12]*5
+session.close()
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
 @pytest.mark.parametrize("failure", ["logprob", "compression", "silence"])
-def test_default_retries_failed_quality_checks_and_stops_on_silence(
-    cpu_native, failure, monkeypatch
-):
+def test_default_retries_failed_quality_checks_and_stops_on_silence(cpu_native, failure):
     """Poor scores or repeated text trigger hotter attempts with five candidates; silence ends retries."""
-    from tokenizers import Tokenizer, models
-
-    from listenflow.fastest_whisper._decoding import DecodingSettings
-    from listenflow.fastest_whisper._inference import TensorRTWhisper
-
-    model, _, _, _, _ = cpu_native
-    generator = np.random.default_rng(2026)
-    monkeypatch.setattr(np.random, "default_rng", lambda: generator)
-    if failure == "compression":
-        model.eot = 10
-        model.tokenizer = Tokenizer(
-            models.WordLevel({"[UNK]": 0, "hello" * 100: 8}, unk_token="[UNK]")
-        )
-    else:
-        model._test_logprob = -3.0
-        model._test_silence = 0.7 if failure == "silence" else 0.1
-    attempts = []
-
-    def observe(frame, event, _argument):
-        if event == "call" and frame.f_code is TensorRTWhisper._decode_attempt.__code__:
-            arguments = frame.f_locals
-            attempts.append(
-                (arguments["temperature"], arguments["beam_size"], arguments["best_of"])
-            )
-
-    previous_profile = sys.getprofile()
-    sys.setprofile(observe)
-    try:
-        result = model.decode_short(
-            model.encode(np.zeros((128, 3000), dtype=np.float32)), [], DecodingSettings()
-        )
-    finally:
-        sys.setprofile(previous_profile)
-
-    assert result.tokens[-1] == model.eot
-    expected = [(0.0, None, None)]
-    if failure == "logprob":
-        expected += [(0.2, None, 5)]
-    elif failure == "compression":
-        expected += [(temperature, None, 5) for temperature in (0.2, 0.4, 0.6, 0.8, 1.0)]
-    assert attempts == expected
+    cpu_native.run(
+        "failure="
+        + repr(failure)
+        + "\n"
+        + """
+import sys
+from tokenizers import Tokenizer, models
+from listenflow.fastest_whisper._inference import TensorRTWhisper
+if failure == 'compression':
+    model.tokenizer = Tokenizer(models.WordLevel({'[UNK]':0, 'hello'*100:1, '<|endoftext|>':3}, unk_token='[UNK]'))
+else:
+    observer.lffw_test_quality(-3.0, 0.7 if failure == 'silence' else 0.1)
+audio = model.encode(features)
+expected = model.decode_short(audio, [], DecodingSettings())
+attempts=[]
+def observe(frame,event,arg):
+    if event=='call' and frame.f_code is TensorRTWhisper._decode_attempt.__code__:
+        attempts.append(frame.f_locals['temperature'])
+previous=sys.getprofile()
+sys.setprofile(observe)
+try:
+    with diagnostic.Session() as session:
+        actual=model.decode_short(audio, [], DecodingSettings())
+finally:
+    sys.setprofile(previous)
+assert actual == expected
+assert attempts == ([0.0] if failure=='silence' else [0.0,0.2] if failure=='logprob' else [0.0,0.2,0.4,0.6,0.8,1.0]), attempts
+session.close()
+"""
+    )
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
 def test_repeated_audio_reuses_captured_decoder_work_and_close_returns_graphs(cpu_native):
     """Repeated decoding replays captured work without recapture and closure releases its graphs."""
-    model, _, _, _, _ = cpu_native
-    mel = np.zeros((128, 3000), dtype=np.float32)
-    first = model.greedy_decode(model.encode(mel))
-    captures = model._test_graph_state.captures
-    second = model.greedy_decode(model.encode(mel))
-    assert first.tokens == second.tokens == [8, 5]
-    assert captures > 0
-    assert model._test_graph_state.captures == captures
-    model.close()
-    assert not model._test_graph_state.executables
+    cpu_native.run("""
+audio = model.encode(features)
+first = model.greedy_decode(audio)
+captures = observer.lffw_test_graph_captures()
+with diagnostic.Session() as session:
+    second = model.greedy_decode(audio)
+assert first.tokens == second.tokens == [1, 3]
+assert observer.lffw_test_graph_captures() == captures
+assert not any(span['graph_capture'] for item in session.records for span in item['spans'])
+session.close()
+model.close()
+assert observer.lffw_test_live_resources() == 0
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
@@ -670,98 +320,160 @@ def test_profile_reports_interpolated_p95_for_components_and_decoder_steps():
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
 def test_profile_uses_product_transcription_and_records_executed_cache_buckets(cpu_native):
     """Product transcription retains its text, tokens and actual padded cache work."""
-    from listenflow.fastest_whisper._cached_model import CachedWhisper
+    cpu_native.run("""
+expected = model.transcribe(waveform, beam_size=1, temperature=0, best_of=1)
+with profile_latency.DecoderProfiler(model) as profiler:
+    row = profiler.measure({'id':'product', 'frames':'16000'}, waveform)
+assert row['output'] == ' '.join(segment.text for segment in expected)
+assert row['tokens'] == [1, 3]
+assert row['entrypoint'] == 'CachedWhisper.transcribe'
+assert [item['bucket'] for item in row['decoder_buckets']] == [1, 8, 8, 8, 8]
+""")
 
-    model, cudart, clock, _, _ = cpu_native
-    # Reuse the real native model and all its state as the cached product subclass.
-    model.__class__ = CachedWhisper
-    model._mel = model._test_mel_factory()
-    audio = np.zeros(16_000, dtype=np.float32)
-    expected = model.transcribe(audio, beam_size=1, temperature=0, best_of=1)
-    with profile_latency.DecoderProfiler(model, cudart, clock=clock) as profiler:
-        row = profiler.measure(_row("product", 1), audio)
-    assert row["output"] == " ".join(segment.text for segment in expected)
-    assert row["tokens"] == [8, 5]
-    assert row["entrypoint"] == "CachedWhisper.transcribe"
-    assert [item["bucket"] for item in row["decoder_buckets"]] == [1, 8, 8, 8, 8]
-    assert sum(item["gpu_seconds"] for item in row["decoder_buckets"]) == pytest.approx(
-        row["decoder_gpu_seconds"]
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-005")
+@pytest.mark.parametrize("script", ["profile", "benchmark", "trial", "timeline"])
+def test_profile_queries_gpu_only_before_and_after_all_utterances(cpu_native, script):
+    """Each runner brackets real native transcription with two spaced GPU snapshots."""
+    cpu_native.run(
+        f"script = {script!r}\n"
+        + r"""
+import csv
+import os
+import sys
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+import soundfile as sf
+from scripts import benchmark_latency
+from gpu_query_fixture import gpu_queries
+from cuda.bindings import runtime as cudart
+
+measured = []
+def observe(frame, event, argument):
+    if event == 'return' and frame.f_code is model._greedy_attempt.__code__:
+        measured.append(argument.text)
+        snapshots.completed = len(measured)
+
+with TemporaryDirectory() as temporary:
+    root = Path(temporary)
+    selected = []
+    for band, seconds in enumerate((1, 5, 10, 20)):
+        audio = root / f'{band}.wav'
+        sf.write(audio, np.zeros(seconds * 16000, np.float32), 16000)
+        selected.append(dict(subset='test-clean', id=f'{band}', audio=str(audio),
+                             frames=seconds * 16000, reference='a'))
+    manifest = root / 'manifest.csv'
+    with manifest.open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(selected[0]))
+        writer.writeheader()
+        writer.writerows(selected)
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(observe)
+        with (
+            gpu_queries() as snapshots,
+            patch.dict(os.environ, {'XDG_CACHE_HOME': str(root / 'cache')}),
+            patch.object(cudart, 'cudaDeviceSynchronize', lambda: (cudart.cudaError_t.cudaSuccess,)),
+            patch.object(cudart, 'cudaProfilerStart', lambda: (cudart.cudaError_t.cudaSuccess,)),
+            patch.object(cudart, 'cudaProfilerStop', lambda: (cudart.cudaError_t.cudaSuccess,)),
+        ):
+            if script == 'profile':
+                profile_latency.run(model.checkpoint_dir, manifest, root / 'output', per_band=1)
+            elif script == 'benchmark':
+                data = root / 'data'
+                from test_latency_comparison import _fleurs_shard
+                _fleurs_shard(data, 'en', ['a'] * 4)
+                benchmark_latency.run('fp16', model.checkpoint_dir, None, root / 'output',
+                                      None, data_dir=data, limit=4)
+            elif script == 'trial':
+                from scripts import fp8_trial
+                with patch.object(sys, 'argv', [
+                    'fp8_trial', 'smoke', '--precision', 'fp32',
+                    '--checkpoint-dir', str(model.checkpoint_dir), '--manifest', str(manifest),
+                    '--output-dir', str(root / 'output'), '--per-band', '1',
+                ]):
+                    fp8_trial.main()
+            else:
+                from scripts import profile_timeline
+                profile_timeline.run(model.checkpoint_dir, manifest, root / 'output')
+    finally:
+        sys.setprofile(previous)
+    assert len(snapshots.calls) == 2, snapshots.calls
+    assert [count for _, count, _ in snapshots.calls] == [0, len(measured)]
+    assert measured
+    assert all(args == ['nvidia-smi', '-q', '-x'] for args, _, _ in snapshots.calls)
+    assert snapshots.calls[1][2] - snapshots.calls[0][2] >= 60
+    assert all(count in (0, len(measured)) for count, seconds in snapshots.sleeps)
+    output = root / 'output'
+    if script == 'profile':
+        report = json.loads((output / 'report.json').read_text())
+        assert report['metadata']['gpu_before_load']['completed_utterances'] == 0
+        assert [row['completed_utterances'] for row in report['metadata']['gpu_observations']] == [0, 4]
+        assert report['selected_utterance_ids'] == [row['id'] for row in selected]
+        assert all(band['count'] == 1 for band in report['bands'].values())
+        assert len((output / 'utterances.jsonl').read_text().splitlines()) == 4
+        assert not (output / 'utterances.jsonl.partial').exists()
+    elif script == 'benchmark':
+        report = json.loads((output / 'fp16.json').read_text())
+        assert report['tensor_rt_path']['engine_reused'] == dict.fromkeys(('mel','encoder','decoder'),False)
+        assert len(list(csv.DictReader((output / 'fp16.csv').open()))) == 4
+    elif script == 'trial':
+        report = json.loads((output / 'report.json').read_text())
+        assert len(report['utterances']) == 4
+    else:
+        report = json.loads((output / 'timeline.json').read_text())
+        assert len(report['utterances']) == len(report['warmup']) == 4
+"""
     )
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
-def test_timeline_preserves_product_output_and_closes_capture_after_failure(
-    cpu_native, monkeypatch
-):
+def test_timeline_preserves_product_output_and_closes_capture_after_failure(cpu_native):
     """CUDA tracing keeps real transcription and closes its capture if native execution fails."""
-    from scripts import profile_timeline
-
-    from listenflow.fastest_whisper._cached_model import CachedWhisper
-
-    model, cudart, _, _, _ = cpu_native
-    model.__class__ = CachedWhisper
-    model._mel = model._test_mel_factory()
-    sample = (_row("trace", 1), np.zeros(16_000, dtype=np.float32))
-    captures = []
-    success = cudart.cudaError_t.cudaSuccess
-    monkeypatch.setattr(
-        cudart, "cudaProfilerStart", lambda: (captures.append("start"), (success,))[1]
-    )
-    monkeypatch.setattr(
-        cudart, "cudaProfilerStop", lambda: (captures.append("stop"), (success,))[1]
-    )
-    rows = profile_timeline.capture_transcriptions(model, [sample], cudart)
-    assert rows[0]["id"] == "trace"
-    assert rows[0]["output"] == "hello"
-    assert captures == ["start", "stop"]
-    monkeypatch.setattr(
-        cudart, "cudaMemcpyAsync", lambda *args: (cudart.cudaError_t.cudaErrorUnknown,)
-    )
-    with pytest.raises(RuntimeError, match="cudaMemcpyAsync"):
-        profile_timeline.capture_transcriptions(model, [sample], cudart)
-    assert captures == ["start", "stop", "start", "stop"]
+    cpu_native.run("""
+from scripts.decoder_host_capture import capture_transcriptions
+samples = [({'id':'trace', 'frames':'16000'}, waveform)]
+rows = capture_transcriptions(model, samples)
+assert rows[0]['output'] == 'a'
+assert rows[0]['native_operations']
+observer.lffw_test_fail_next(4)
+try:
+    capture_transcriptions(model, samples)
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('copy failure ignored')
+with diagnostic.Session(1) as session:
+    assert _native.abi_version() == (1,0,0)
+assert len(session.records)==1
+session.close()
+""")
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-011")
-def test_layer_profiling_releases_its_context_without_detaching_a_null_profiler(
-    cpu_native, monkeypatch
-):
-    """Layer diagnostics leave product contexts intact when TensorRT rejects a null profiler."""
+@pytest.mark.req("SP-LFFASTESTWHISPER-012")
+def test_capture_stops_and_drains_gpu_after_a_failed_product_call():
+    """A failed observed call still drains before stopping the external CUDA collector."""
     from scripts import profile_layers
 
-    model, _, _, _, _ = cpu_native
-    io = model._encoder
-    original_execution = io.execution
-    context_type = type(io.execution._context)
+    calls = []
 
-    def set_profiler(context, profiler):
-        if profiler is None:
-            raise ValueError("TensorRT forbids null profiler")
-        context._test_profiler = profiler
+    class Driver:
+        def cuProfilerStart(self):
+            calls.append("start")
+            return (0,)
 
-    monkeypatch.setattr(
-        context_type,
-        "profiler",
-        property(lambda context: getattr(context, "_test_profiler", None), set_profiler),
-        raising=False,
-    )
-    monkeypatch.setattr(context_type, "enqueue_emits_profile", True, raising=False)
+        def cuCtxSynchronize(self):
+            calls.append("drain")
+            return (0,)
 
-    def report(context):
-        context.profiler.report_layer_time("(Unnamed Layer* 1) [Matrix Multiply]", 2.0)
-        return True
+        def cuProfilerStop(self):
+            calls.append("stop")
+            return (0,)
 
-    monkeypatch.setattr(context_type, "report_to_profiler", report, raising=False)
-    engine_type = type(io.execution._handle.engine)
-    monkeypatch.setattr(
-        engine_type,
-        "create_engine_inspector",
-        lambda engine: SimpleNamespace(get_engine_information=lambda format: '{"Layers": []}'),
-        raising=False,
-    )
-    report = profile_layers.profile_io(
-        io, {"mel": np.zeros((1, 128, 3000), dtype=np.float32)}, iterations=2
-    )
-    assert report["total_mean_ms"] == 2
-    assert io.execution is original_execution
-    assert original_execution._context.profiler is None
+    with (
+        pytest.raises(RuntimeError, match="product failed"),
+        profile_layers.capture_range(Driver()),
+    ):
+        calls.append("product")
+        raise RuntimeError("product failed")
+    assert calls == ["start", "product", "drain", "stop"]

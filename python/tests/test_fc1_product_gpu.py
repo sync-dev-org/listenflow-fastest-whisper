@@ -1,4 +1,4 @@
-"""Product graphs and execution keep the adopted fp16 fc1 implementation."""
+"""Product warmup and cancellation keep the adopted fp16 fc1 implementation."""
 
 import json
 import os
@@ -17,41 +17,6 @@ def checkpoint():
     if os.environ.get("LFFW_USE_GPU") != "1" or not value:
         pytest.skip("set LFFW_USE_GPU=1 and LFFW_CHECKPOINT_DIR for product fc1 checks")
     return Path(value)
-
-
-@pytest.mark.gpu
-@pytest.mark.req("SP-LFFASTESTWHISPER-002")
-@pytest.mark.req("SP-LFFASTESTWHISPER-004")
-@pytest.mark.parametrize(
-    "precision,part", [(p, g) for p in ("fp32", "fp16") for g in ("encoder", "decoder")]
-)
-def test_assembled_whisper_graph_uses_fc1_only_for_the_fp16_decoder(checkpoint, precision, part):
-    """All 32 fp16 decoder expansions are plugins; both encoders and the fp32 decoder use none."""
-    import tensorrt as trt
-    from tensoracle._plugins import register_libraries
-
-    from listenflow.fastest_whisper._checkpoint import Checkpoint
-    from listenflow.fastest_whisper._network import _Graph
-    from listenflow.fastest_whisper._plugins import _fc1_library
-
-    register_libraries((_fc1_library(),))
-    logger = trt.Logger(trt.Logger.ERROR)
-    builder = trt.Builder(logger)
-    network = builder.create_network(0)
-    with Checkpoint(checkpoint) as source:
-        graph = _Graph(network, source, precision)
-        getattr(graph, part)()
-        layers = [network.get_layer(index) for index in range(network.num_layers)]
-        plugins = [layer for layer in layers if layer.type == trt.LayerType.PLUGIN_V3]
-        expected = precision == "fp16" and part == "decoder"
-        assert [layer.name for layer in plugins] == (
-            [f"model.decoder.layers.{index}.fc1.gelu" for index in range(32)] if expected else []
-        )
-        for layer in plugins:
-            assert tuple(layer.get_input(0).shape) == (1, 1, 1280)
-            assert tuple(layer.get_input(1).shape) == (5120, 1280)
-            assert tuple(layer.get_input(2).shape) == (5120,)
-            assert tuple(layer.get_output(0).shape) == (1, 1, 5120)
 
 
 @pytest.mark.gpu
@@ -78,7 +43,8 @@ def test_product_warmup_graphs_cancellation_and_release_execute_fc1(checkpoint, 
     observed = json.loads(result.stdout.splitlines()[-1])
     assert observed["warmup_fc1_launches"] > 0
     assert observed["cancelled_steps"] == 4
-    assert observed["graph_contexts"] >= 2
+    # Native capture counts across all 448 positions are checked through the
+    # C ABI in test_all_context_positions_use_only_sixteen_native_graphs.
     assert observed["text"]
     events = [line.split("|") for line in log.read_text().splitlines()]
     assert all(int(event[4]) == 0 for event in events)

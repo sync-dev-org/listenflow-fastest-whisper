@@ -4,7 +4,7 @@ import asyncio
 
 import numpy as np
 import pytest
-from tensoracle import CorruptEngineError, EngineConditionError, EngineIOError
+from listenflow.fastest_whisper._native import NativeError
 
 from listenflow import (
     ConfigurationError,
@@ -90,10 +90,8 @@ class _Model:
 @pytest.fixture
 def native(monkeypatch):
     from listenflow.fastest_whisper import _cached_model
-    from listenflow.fastest_whisper import _engine as engine_module
 
     # Device enumeration is a native CUDA boundary; no CUDA calls run in CPU tests.
-    monkeypatch.setattr(engine_module, "_cuda_device_info", lambda device: (2, (12, 0)))
 
     def install(model):
         monkeypatch.setattr(_cached_model, "CachedWhisper", lambda *args, **kwargs: model)
@@ -444,15 +442,16 @@ def test_unknown_language_raises_the_exported_configuration_error(tmp_path, lang
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-008")
 @pytest.mark.req("SP-LFFASTESTWHISPER-019")
-@pytest.mark.parametrize("error_type", [CorruptEngineError, EngineConditionError, EngineIOError])
+@pytest.mark.parametrize("status", [100, 101, 102])
 def test_prepare_preserves_cache_failure_without_caller_rebuild_guidance(
-    tmp_path, native, monkeypatch, error_type
+    tmp_path, native, monkeypatch, status
 ):
     """An unrecoverable cache failure reports its path and cause without a rebuild setting."""
     from listenflow.fastest_whisper import _cached_model
 
     native(_Model())
-    cause = error_type(f"invalid cached engine: {tmp_path / 'broken.engine'}")
+    cause = NativeError(f"invalid cached engine: {tmp_path / 'broken.engine'}")
+    cause.status = status
 
     def fail(*args, **kwargs):
         raise cause
@@ -589,35 +588,23 @@ def test_prepare_reports_runtime_unavailability_before_loading(
     tmp_path, native, monkeypatch, problem
 ):
     """CUDA, device, GPU generation, and TensorRT problems fail preparation with their cause."""
-    from listenflow.fastest_whisper import _engine as engine_module
+    from listenflow.fastest_whisper import _cached_model
 
     model = native(_Model())
-    cause = None
-    device = 0
-    if problem == "cuda":
-        cause = RuntimeError("CUDA unavailable")
+    error_type = (
+        ImportError
+        if problem == "tensorrt_import"
+        else OSError
+        if problem == "tensorrt_os"
+        else RuntimeError
+    )
+    cause = error_type(f"native {problem} unavailable or unsupported")
 
-        def fail_cuda(_device):
-            raise cause
+    def fail_native(*args, **kwargs):
+        raise cause
 
-        monkeypatch.setattr(engine_module, "_cuda_device_info", fail_cuda)
-    elif problem == "device":
-        device = 2
-        monkeypatch.setattr(engine_module, "_cuda_device_info", lambda device: (1, None))
-    elif problem == "capability":
-        monkeypatch.setattr(engine_module, "_cuda_device_info", lambda device: (1, (9, 0)))
-    else:
-        error_type = ImportError if problem == "tensorrt_import" else OSError
-        cause = error_type("TensorRT unavailable")
-        original_import = engine_module.importlib.import_module
-
-        def no_tensorrt(name):
-            if name == "tensorrt":
-                raise cause
-            return original_import(name)
-
-        monkeypatch.setattr(engine_module.importlib, "import_module", no_tensorrt)
-    engine = _engine(tmp_path, device=device)
+    monkeypatch.setattr(_cached_model, "CachedWhisper", fail_native)
+    engine = _engine(tmp_path, device=2 if problem == "device" else 0)
     with pytest.raises(EnvironmentUnavailableError, match="unavailable|unsupported") as failure:
         native.run(engine.prepare())
     if cause is not None:
@@ -669,7 +656,7 @@ def test_prepare_maps_native_binding_import_failure_before_allocating(
     original_import = builtins.__import__
 
     def unavailable(name, *args, **kwargs):
-        if name == "tensoracle":
+        if "_native" in (kwargs.get("fromlist") or (args[2] if len(args) > 2 else ()) or ()):
             raise cause
         return original_import(name, *args, **kwargs)
 

@@ -135,43 +135,41 @@ def test_csv_has_timestamps_partition_fields_and_round_trips_quoted_ids(tmp_path
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-003")
-def test_observer_preserves_real_product_tokens_and_covers_each_run(cpu_native, monkeypatch):
+def test_observer_preserves_real_product_tokens_and_covers_each_run(cpu_native):
     """Wrapping the actual product retains its output and counts each decoder invocation."""
-    import numpy as np
-
-    model, cu, clock, _, _ = cpu_native
-    monkeypatch.setattr(cu, "cudaEventSynchronize", lambda event: (cu.cudaError_t.cudaSuccess,))
-    encoder = model.encode(np.zeros((128, 3000), dtype=np.float32))
-    expected = model.greedy_decode(encoder)
-    with profile.StepProfiler(model, cu, clock=lambda: round(clock() * 1e9)) as observer:
-        actual, rows = observer.capture(lambda: model.greedy_decode(encoder))
-        drift = observer.check_clock()
-    assert actual.tokens == expected.tokens == [8, 5]
-    assert len(rows) == 5
-    assert [row["bucket"] for row in rows] == [1, 8, 8, 8, 8]
-    assert [row["output_token"] for row in rows] == [8, 8, 8, 8, 5]
-    assert all(profile.partition_error(row) == 0 for row in rows)
-    assert all(row["graph_gpu_ns"] == 2_000_000 for row in rows)
-    assert all(row["h2d_ns"] > 0 and row["d2h_sync_ns"] > 0 for row in rows)
-    assert rows[-1]["end_ns"] - rows[0]["start_ns"] == sum(row["total_ns"] for row in rows)
-    assert abs(drift["drift_ns"]) <= drift["uncertainty_ns"]
+    cpu_native.run("""
+audio=model.encode(features)
+expected=model.greedy_decode(audio)
+with host_profile.StepProfiler(model) as profiler:
+    actual, rows=profiler.capture(lambda:model.greedy_decode(audio))
+assert actual.tokens == expected.tokens == [1,3]
+assert len(rows)==5
+assert [row['bucket'] for row in rows]==[1,8,8,8,8]
+assert [row['output_token'] for row in rows]==[1,1,1,1,3]
+assert all(host_profile.partition_error(row)==0 for row in rows)
+assert all(row['graph_gpu_ns']>0 for row in rows)
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
-def test_observer_restores_product_methods_and_rejects_cold_graphs(cpu_native, monkeypatch):
+def test_observer_restores_product_methods_and_rejects_cold_graphs(cpu_native):
     """Measurement never silently includes a graph build or leaves hooks after a failure."""
-    import numpy as np
-
-    from listenflow.fastest_whisper._inference import _HostIO
-
-    model, cu, _, _, _ = cpu_native
-    original_run, original_copy = _HostIO.run, cu.cudaMemcpyAsync
-    monkeypatch.setattr(cu, "cudaEventSynchronize", lambda event: (cu.cudaError_t.cudaSuccess,))
-    encoder = model.encode(np.zeros((128, 3000), dtype=np.float32))
-    with pytest.raises(RuntimeError, match="warm"), profile.StepProfiler(model, cu) as observer:
-        observer.capture(lambda: model.greedy_decode(encoder))
-    assert _HostIO.run is original_run
-    assert cu.cudaMemcpyAsync is original_copy
+    cpu_native.run("""
+audio=model.encode(features)
+original=model._greedy_step
+try:
+    with host_profile.StepProfiler(model) as profiler:
+        profiler.capture(lambda:model.greedy_decode(audio))
+except RuntimeError as error:
+    assert 'warm' in str(error)
+else:
+    raise AssertionError('cold graph accepted')
+assert model._greedy_step == original
+with diagnostic.Session(1) as session:
+    _native.abi_version()
+assert len(session.records)==1
+session.close()
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
@@ -191,30 +189,18 @@ def test_load_workers_report_real_proc_usage_and_stop_after_failure():
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
-def test_wall_control_times_product_without_adding_timing_events(cpu_native, monkeypatch):
+def test_wall_control_times_product_without_adding_timing_events(cpu_native):
     """Whole-step observation preserves tokens and records only product completion events."""
-    import numpy as np
-
-    model, cu, clock, _, _ = cpu_native
-    encoder = model.encode(np.zeros((128, 3000), dtype=np.float32))
-    expected = model.greedy_decode(encoder)
-
-    def forbidden(*_args):
-        raise AssertionError("event-free control used a CUDA event")
-
-    original_record = cu.cudaEventRecord
-
-    def record(event, stream):
-        assert event == model._decoder._completion
-        return original_record(event, stream)
-
-    monkeypatch.setattr(cu, "cudaEventRecord", record)
-    monkeypatch.setattr(cu, "cudaEventCreate", forbidden)
-    with profile.WallProfiler(model, clock=lambda: round(clock() * 1e9)) as observer:
-        actual, rows = observer.capture(lambda: model.greedy_decode(encoder))
-    assert actual.tokens == expected.tokens
-    assert len(rows) == 5
-    assert all(row["total_ns"] > 0 for row in rows)
+    cpu_native.run("""
+audio=model.encode(features)
+expected=model.greedy_decode(audio)
+created=observer.lffw_test_timing_events()
+with host_profile.WallProfiler(model) as profiler:
+    actual,rows=profiler.capture(lambda:model.greedy_decode(audio))
+assert actual.tokens==expected.tokens==[1,3]
+assert len(rows)==5 and all(row['total_ns']>0 for row in rows)
+assert observer.lffw_test_timing_events()==created
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
@@ -239,54 +225,41 @@ def test_tail_partition_retains_stream_gap_copy_and_host_return_without_overlap(
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-003")
-def test_tail_observer_times_copy_and_wait_cpu_without_changing_product(cpu_native, monkeypatch):
+def test_tail_observer_times_copy_and_wait_cpu_without_changing_product(cpu_native):
     """Detailed observation preserves tokens and partitions every post-graph interval exactly."""
-    import numpy as np
-
-    model, cu, clock, _, _ = cpu_native
-    monkeypatch.setattr(cu, "cudaEventSynchronize", lambda event: (cu.cudaError_t.cudaSuccess,))
-    encoder = model.encode(np.zeros((128, 3000), dtype=np.float32))
-    expected = model.greedy_decode(encoder)
-    with profile.StepProfiler(
-        model, cu, clock=lambda: round(clock() * 1e9), detailed=True
-    ) as observer:
-        actual, rows = observer.capture(lambda: model.greedy_decode(encoder))
-    assert actual.tokens == expected.tokens
-    for row in rows:
-        assert row["copy_event_window_ns"] == 1_000_000
-        assert row["copy_bytes"] == 4
-        assert row["wait_cpu_ns"] >= 0
-        assert row["wait_wall_ns"] > 0
-        assert row["run_return_ns"] <= row["end_ns"]
-        assert row["tail_ns"] == sum(
-            row[name] for name in ("before_copy_ns", "copy_window_ns", "host_return_ns")
-        )
-        assert profile.partition_error(row) == 0
+    cpu_native.run("""
+audio=model.encode(features)
+expected=model.greedy_decode(audio)
+with host_profile.StepProfiler(model,detailed=True) as profiler:
+    actual,rows=profiler.capture(lambda:model.greedy_decode(audio))
+assert actual.tokens==expected.tokens
+for row in rows:
+    assert row['copy_bytes']==4
+    assert row['copy_event_window_ns']>0
+    assert row['wait_wall_ns']>0 and row['wait_cpu_ns']>=0
+    assert row['graph_end_lower_ns']<=row['graph_end_ns']<=row['graph_end_upper_ns']
+    assert row['tail_ns']==sum(row[name] for name in ('before_copy_ns','copy_window_ns','host_return_ns'))
+    assert host_profile.partition_error(row)==0
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
-def test_wait_observer_retains_tokens_and_records_cpu_without_cuda_events(cpu_native, monkeypatch):
+def test_wait_observer_retains_tokens_and_records_cpu_without_cuda_events(cpu_native):
     """Wait-policy comparisons record CPU spent in copy/sync calls without recording events."""
-    import numpy as np
-
-    model, cu, _, _, _ = cpu_native
-    encoder = model.encode(np.zeros((128, 3000), dtype=np.float32))
-    expected = model.greedy_decode(encoder)
-
-    def forbidden(*_args):
-        raise AssertionError("wait-policy measurement recorded an event")
-
-    monkeypatch.setattr(cu, "cudaEventCreate", forbidden)
-    cpu_ticks = iter(range(0, 10_000, 10))
-    monkeypatch.setattr(profile.time, "thread_time_ns", lambda: next(cpu_ticks))
-    with profile.WaitProfiler(model, cu) as observer:
-        actual, rows = observer.capture(lambda: model.greedy_decode(encoder))
-    assert actual.tokens == expected.tokens
-    assert len(rows) == 5
-    assert all(row["wait_cpu_ns"] >= 0 and row["wait_wall_ns"] > 0 for row in rows)
-    assert all(row["wait_cpu_ns"] == 20 for row in rows)
-    assert all(row["copy_cpu_ns"] == row["sync_cpu_ns"] == 10 for row in rows)
-    assert all(row["wait_wall_ns"] == row["copy_wall_ns"] + row["sync_wall_ns"] for row in rows)
+    cpu_native.run("""
+audio=model.encode(features)
+expected=model.greedy_decode(audio)
+created=observer.lffw_test_timing_events()
+with host_profile.WaitProfiler(model) as profiler:
+    actual,rows=profiler.capture(lambda:model.greedy_decode(audio))
+assert actual.tokens==expected.tokens
+assert len(rows)==5
+assert observer.lffw_test_timing_events()==created
+for row in rows:
+    assert row['wait_cpu_ns']==row['copy_cpu_ns']+row['sync_cpu_ns']
+    assert row['wait_wall_ns']==row['copy_wall_ns']+row['sync_wall_ns']
+    assert row['wait_wall_ns']>0 and row['wait_cpu_ns']>=0
+""")
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-010")
@@ -309,46 +282,17 @@ def test_schedule_is_set_only_when_requested_and_refuses_a_rejected_policy():
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
-def test_wait_observer_counts_queries_and_retains_each_actual_sleep(cpu_native, monkeypatch):
+def test_wait_observer_counts_queries_and_retains_each_actual_sleep(cpu_native):
     """Each measured decoder step retains its own query count and individual sleep durations."""
-    import itertools
-    import json
-
-    import numpy as np
-
-    from listenflow.fastest_whisper import _inference
-
-    model, cu, _, _, _ = cpu_native
-    encoder = model.encode(np.zeros((128, 3000), dtype=np.float32))
-    expected = model.greedy_decode(encoder)
-    statuses = itertools.cycle(
-        [cu.cudaError_t.cudaErrorNotReady] * 2 + [cu.cudaError_t.cudaSuccess]
-    )
-    original_query = cu.cudaEventQuery
-    sleep_clock = [0]
-    intervals = []
-
-    def sleep(interval):
-        intervals.append(interval)
-        sleep_clock[0] += len(intervals) * 100
-
-    monkeypatch.setattr(cu, "cudaEventQuery", lambda event: (next(statuses),))
-    monkeypatch.setattr(_inference, "sleep", sleep)
-    monkeypatch.setattr(profile.time, "perf_counter_ns", lambda: sleep_clock[0])
-    query_before = cu.cudaEventQuery
-    with profile.WaitProfiler(model, cu) as observer:
-        actual, rows = observer.capture(lambda: model.greedy_decode(encoder))
-    assert actual.tokens == expected.tokens
-    assert len(rows) == 5
-    assert [row["query_count"] for row in rows] == [3] * 5
-    assert [json.loads(row["sleep_ns"]) for row in rows] == [
-        [100, 200],
-        [300, 400],
-        [500, 600],
-        [700, 800],
-        [900, 1000],
-    ]
-    assert intervals == [50e-6] * 10
-    assert cu.cudaEventQuery is query_before
-    assert _inference.sleep is sleep
-    monkeypatch.setattr(cu, "cudaEventQuery", original_query)
+    cpu_native.run("""
+audio=model.encode(features)
+expected=model.greedy_decode(audio)
+observer.lffw_test_query_delay(2)
+with host_profile.WaitProfiler(model) as profiler:
+    actual,rows=profiler.capture(lambda:model.greedy_decode(audio))
+assert actual.tokens==expected.tokens
+assert [row['query_count'] for row in rows]==[3]*5
+assert all(len(json.loads(row['sleep_ns']))==2 for row in rows)
+assert all(value>0 for row in rows for value in json.loads(row['sleep_ns']))
+assert all(sleep['requested_ns']==50000 for row in rows for sleep in row['sleeps'])
+""")

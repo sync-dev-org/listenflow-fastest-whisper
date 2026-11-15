@@ -250,17 +250,14 @@ def test_device_selected_greedy_tokens_stop_on_repetition_and_release_the_cache(
     calls = []
 
     class Decoder:
-        outputs = ("token",)
+        closed = False
 
-        def run(self, inputs, **_):
-            calls.append(int(inputs["positions"][0, 0]))
-            return {
-                "greedy": np.array([0, -0.2, 0.1], dtype=np.float32),
-                "token": np.array([0], dtype=np.int32),
-                "logits": np.zeros(1),
-                "present_keys": np.zeros(1),
-                "present_values": np.zeros(1),
-            }
+        def greedy_step(self, token, first, score):
+            calls.append(len(calls))
+            return 0, -0.2, 0.1
+
+        def close(self):
+            self.closed = True
 
     model = TensorRTWhisper.__new__(TensorRTWhisper)
     model.config = SimpleNamespace(
@@ -271,12 +268,15 @@ def test_device_selected_greedy_tokens_stop_on_repetition_and_release_the_cache(
     model.eot = 3
     model.suppressed = model.begin_suppressed = set()
     model._prefix_states = {}
-    model._decoder = Decoder()
+    decoder = Decoder()
+    model._native_model = SimpleNamespace(close=lambda: None)
+    model._greedy_decoder = None
+    model._greedy_length = 0
     model.tokenizer = SimpleNamespace(
         token_to_id={"<|nospeech|>": 5}.get,
         decode=lambda tokens, **_: "".join("a" for _ in tokens),
     )
-    encoder = SimpleNamespace(tensors={"cross_keys": np.zeros(1), "cross_values": np.zeros(1)})
+    encoder = SimpleNamespace(decoder=lambda kind: decoder, close=lambda: None)
     model._encoded_audio = encoder
     settings = DecodingSettings(
         temperatures=(0.0,),
@@ -286,7 +286,8 @@ def test_device_selected_greedy_tokens_stop_on_repetition_and_release_the_cache(
     actual = model.decode_short(encoder, [], settings)
     assert actual.text == "a" * (3 if enabled else 8)
     assert len(calls) == (3 if enabled else 8)
-    assert model._greedy_cache == {}
+    assert model._greedy_decoder is None
+    assert decoder.closed
 
 
 @pytest.fixture
@@ -336,16 +337,20 @@ def byte_level_model():
             return values
 
         class NativeSamples:
-            def run(self, inputs, **_):
-                position = int(inputs["positions"][0, 0])
+            position = 0
+
+            def sampled_step(self, inputs, suppression, temperature, uniform, timestamps):
+                position = self.position
+                self.position += 1
                 index = position + 1 - len(model.initial_tokens)
                 token = next_token(index) if index >= 0 else tokens[0]
-                return {
-                    "sampled": np.array([[[token, 0, 0]], [[token, 0, 0]]], np.float32),
-                    "logits": np.zeros(1),
-                    "present_keys": inputs["self_keys"],
-                    "present_values": inputs["self_values"],
-                }
+                return np.full(2, token, np.int32), np.zeros(2, np.float32), np.zeros(2, np.float32)
+
+            def decoder(self, kind, batch):
+                return self
+
+            def close(self):
+                pass
 
         model.logits = logits
         if route == "sampled-batch":
@@ -375,7 +380,7 @@ def test_split_unicode_letters_and_combining_marks_do_not_reject_an_unfinished_w
         no_speech_threshold=None,
         rejection=rejection,
     )
-    encoder = SimpleNamespace(tensors={"cross_keys": np.zeros(1), "cross_values": np.zeros(1)})
+    encoder = SimpleNamespace(decoder=lambda kind, batch: model._sampled_decoder)
     result = model.decode_short(encoder, [], settings)
     assert result.text == sentence
     assert result.tokens == tokens + [model.eot]

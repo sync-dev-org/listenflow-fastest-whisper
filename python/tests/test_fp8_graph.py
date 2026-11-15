@@ -1,4 +1,4 @@
-"""Product FP8 quantizes linear operands and preserves half precision boundaries."""
+"""Reference quantization rules and native FP8 calibration inputs."""
 
 import json
 from types import SimpleNamespace
@@ -8,9 +8,10 @@ import pytest
 import tensorrt as trt
 from tokenizers import Tokenizer, models
 
-from listenflow.fastest_whisper import _engines
+from listenflow.fastest_whisper import _inference
 from listenflow.fastest_whisper._checkpoint import ModelConfig
 from listenflow.fastest_whisper._network import _Graph
+from test_native_resources import native_boundary as native_boundary  # noqa: PLC0414
 
 
 class Tensor:
@@ -223,7 +224,7 @@ def test_fp8_quantizes_each_linear_input_and_output_column_but_keeps_other_ops_h
 @pytest.mark.req("SP-LFFASTESTWHISPER-004")
 @pytest.mark.parametrize("precision", ["fp16", "fp32"])
 @pytest.mark.parametrize("part", ["encoder", "decoder"])
-def test_product_graphs_keep_original_dtypes_and_fc1_without_any_quantization(
+def test_reference_graphs_keep_original_dtypes_and_fc1_without_any_quantization(
     tmp_path, monkeypatch, precision, part
 ):
     """The two existing graph precisions never acquire Q/DQ or lose their selected fc1."""
@@ -261,44 +262,44 @@ def test_sampled_fp16_batch_uses_existing_single_row_fc1_with_shared_weights(tmp
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
-def test_fp8_scales_separate_cache_identity_and_do_not_load_fp16_fc1(tmp_path, monkeypatch):
-    """A changed calibration file invalidates only the trial engines and never binds fc1."""
-    from listenflow.fastest_whisper import _fp8
+def test_fp8_scales_reach_native_identity_without_loading_fc1(
+    source_checkpoint, native_boundary, monkeypatch, tmp_path
+):
+    """Calibration is passed separately from safetensors and FP8 never selects the FP16 plugin."""
+    from listenflow.fastest_whisper._cached_model import CachedWhisper
 
-    source = checkpoint(tmp_path)
+    calls, _ = native_boundary
     scales = tmp_path / "scales.json"
-    scales.write_text(json.dumps({key: 0.125 for key in linear_keys()}))
-    monkeypatch.setattr(_fp8, "_SCALES", scales)
-    calls = []
-    monkeypatch.setattr(_engines, "open_engine", lambda *args, **kw: calls.append((args, kw)))
-    monkeypatch.setattr(_engines, "_fc1_library", lambda: pytest.fail("trial must not load fc1"))
-    for decoder in (False, True):
-        _engines.open_whisper_engine(source, decoder=decoder, precision="fp8", logger=None)
-    assert all(call[1]["plugins"] == () for call in calls)
-    assert all("fp8-1" in call[1]["graph_version"] for call in calls)
-    assert all(scales in call[1]["weights"] for call in calls)
-    for args, _ in calls:
-        args[0](Network())
+    values = {key: 0.125 for key in linear_keys()}
+    scales.write_text(json.dumps(values))
+    monkeypatch.setattr(_inference, "FP8_SCALES", scales)
+    monkeypatch.setattr(
+        _inference, "_fc1_library", lambda: pytest.fail("FP8 must not load FP16 fc1")
+    )
+    with CachedWhisper(source_checkpoint, precision="fp8"):
+        pass
+    source, precision = calls[0][:2]
+    assert precision == "fp8"
+    assert source["scale_file"] == str(scales)
+    assert source["scales"] == values
+    assert source["fc1_library"] == ""
+    assert all(path.endswith(".safetensors") for path in source["weights"])
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
 @pytest.mark.parametrize("scales", [None, []])
 def test_invalid_calibration_file_cannot_select_the_product_fp16_graph(
-    tmp_path, monkeypatch, scales
+    source_checkpoint, native_boundary, tmp_path, monkeypatch, scales
 ):
-    """An invalid scale collection fails before opening an engine or selecting another graph."""
-    path = tmp_path / "scales.json"
-    from listenflow.fastest_whisper import _fp8
+    """An invalid scale collection fails before opening native inference or selecting another graph."""
+    from listenflow.fastest_whisper._cached_model import CachedWhisper
 
+    path = tmp_path / "scales.json"
     path.write_text(json.dumps(scales))
-    monkeypatch.setattr(_fp8, "_SCALES", path)
-    calls = []
-    monkeypatch.setattr(_engines, "_fc1_library", lambda: tmp_path / "fc1.so")
-    monkeypatch.setattr(_engines, "open_engine", lambda *args, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(_inference, "FP8_SCALES", path)
+    calls, _ = native_boundary
     with pytest.raises(ValueError, match="scales"):
-        _engines.open_whisper_engine(
-            checkpoint(tmp_path), decoder=False, precision="fp8", logger=None
-        )
+        CachedWhisper(source_checkpoint, precision="fp8")
     assert calls == []
 
 

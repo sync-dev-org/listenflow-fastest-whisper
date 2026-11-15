@@ -19,6 +19,7 @@ import os
 import statistics
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,19 +44,7 @@ from listenflow.fastest_whisper._decoding import DecodingSettings, decoding_sett
 
 
 class _TimedCachedWhisper(CachedWhisper):
-    """Time the product's build-or-load calls without changing their cache policy."""
-
-    def _open_engine(self, checkpoint, *, decoder):
-        started = time.monotonic()
-        handle = super()._open_engine(checkpoint, decoder=decoder)
-        self.build_seconds["decoder" if decoder else "encoder"] = time.monotonic() - started
-        return handle
-
-    def _open_mel(self, checkpoint):
-        started = time.monotonic()
-        handle = super()._open_mel(checkpoint)
-        self.build_seconds["mel"] = time.monotonic() - started
-        return handle
+    """Use the product cache policy and native preparation measurements."""
 
 
 def _cache_engine_hashes() -> dict[str, str]:
@@ -191,42 +180,51 @@ def _load_waveform(row: dict) -> np.ndarray:
     )
 
 
-def _gpu_field(name: str) -> str:
-    return (
-        subprocess.check_output(
-            ["nvidia-smi", f"--query-gpu={name}", "--format=csv,noheader,nounits"], text=True
-        )
-        .splitlines()[0]
-        .strip()
-    )
+_last_gpu_query_at: float | None = None
 
 
 def _gpu_sample(completed: int) -> dict:
+    """Read one complete snapshot, spacing short-lived driver queries by a minute."""
+    global _last_gpu_query_at
+    if _last_gpu_query_at is not None:
+        while (remaining := 60.0 - (time.monotonic() - _last_gpu_query_at)) > 0:
+            time.sleep(min(remaining, 60.0))
+    _last_gpu_query_at = time.monotonic()
+    snapshot = ET.fromstring(subprocess.check_output(["nvidia-smi", "-q", "-x"], text=True))
+    gpu = snapshot.find("gpu")
+    if gpu is None:
+        raise RuntimeError("nvidia-smi snapshot contains no GPU")
     process_ids = [
-        int(value)
-        for value in subprocess.check_output(
-            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
-        ).splitlines()
-        if value.strip()
+        int(process.findtext("pid"))
+        for process in snapshot.findall("gpu/processes/process_info")
+        if "C" in process.findtext("type", "C")
     ]
     others = [pid for pid in process_ids if pid != os.getpid()]
     if others:
         raise RuntimeError(f"other GPU compute processes overlap the comparison: {others}")
-    fields = ("clocks.sm", "utilization.gpu", "memory.used")
-    values = (
-        subprocess.check_output(
-            ["nvidia-smi", f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"],
-            text=True,
-        )
-        .splitlines()[0]
-        .split(",")
-    )
     return {
         "at": datetime.now(UTC).isoformat(),
         "completed_utterances": completed,
         "compute_process_pids": process_ids,
-        **dict(zip(fields, (value.strip() for value in values), strict=True)),
+        "name": gpu.findtext("product_name"),
+        "driver_version": snapshot.findtext("driver_version"),
+        **{
+            key: gpu.findtext(path).split()[0]
+            for key, path in (
+                ("clocks.sm", "clocks/sm_clock"),
+                ("utilization.gpu", "utilization/gpu_util"),
+                ("memory.used", "fb_memory_usage/used"),
+            )
+        },
     }
+
+
+def _engine_paths(model) -> dict[str, Path]:
+    """Read native model paths or the handles retained by the 0.8.4 runtime."""
+    native = getattr(model, "_native_model", None)
+    if native is not None:
+        return {name: Path(path) for name, path in native.info["engine_paths"].items()}
+    return {name: getattr(model, f"_{name}_handle").path for name in ("encoder", "decoder", "mel")}
 
 
 def _synchronize() -> None:
@@ -411,12 +409,8 @@ def run(
     if route == "fp16":
         engine_hashes_loaded = _cache_engine_hashes()
         engine_reused = {
-            name: str(handle.path.resolve()) in engine_hashes_before
-            for name, handle in (
-                ("encoder", model._encoder_handle),
-                ("decoder", model._decoder_handle),
-                ("mel", model._mel_handle),
-            )
+            name: str(path.resolve()) in engine_hashes_before
+            for name, path in _engine_paths(model).items()
         }
         build_seconds = {
             name: seconds if not engine_reused[name] else 0.0
@@ -432,7 +426,6 @@ def run(
         _transcribe_faster_whisper(model, first_waveform, options)
     _synchronize()
     warmup_seconds = time.monotonic() - warmup_started
-    observations.append(_gpu_sample(0))
     with partial_csv.open("x", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(
             stream,
@@ -464,8 +457,8 @@ def run(
             )
             if index % 100 == 0 or index == len(rows):
                 stream.flush()
-                observations.append(_gpu_sample(index))
                 print(f"{name}: {index}/{len(rows)}", flush=True)
+    observations.append(_gpu_sample(len(rows)))
     partial_csv.rename(final_csv)
     if route == "fp16":
         engine_hashes_after = _cache_engine_hashes()
@@ -514,8 +507,8 @@ def run(
             "no_speech_threshold": settings.no_speech_threshold,
             "condition_on_previous_text": False,
         },
-        "gpu": _gpu_field("name"),
-        "driver": _gpu_field("driver_version"),
+        "gpu": observations[0]["name"],
+        "driver": observations[0]["driver_version"],
         "tensorrt": trt.__version__,
         "ctranslate2": ctranslate2.__version__,
         "faster_whisper": faster_whisper.__version__,

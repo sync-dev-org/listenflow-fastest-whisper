@@ -11,6 +11,27 @@ import pytest
 _GPU_DIRECTORY = pytest.StashKey[Path]()
 
 
+@pytest.fixture(scope="session")
+def source_checkpoint(tmp_path_factory):
+    from native_runtime_fixture import prepare_source_checkpoint
+
+    return prepare_source_checkpoint(tmp_path_factory)
+
+
+@pytest.fixture(scope="session")
+def native_checkpoint(source_checkpoint):
+    from native_runtime_fixture import native_checkpoint_lifetime
+
+    yield from native_checkpoint_lifetime(source_checkpoint)
+
+
+@pytest.fixture
+def native_model(native_checkpoint):
+    from native_runtime_fixture import native_model_lifetime
+
+    yield from native_model_lifetime(native_checkpoint)
+
+
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item, nextitem):
     if not item.get_closest_marker("gpu") or os.environ.get("LFFW_USE_GPU") != "1":

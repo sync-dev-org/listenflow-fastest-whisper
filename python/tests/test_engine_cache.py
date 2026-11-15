@@ -1,193 +1,68 @@
-"""Saved TensorRT graphs are reused or rebuilt without caller configuration."""
+"""Saved native engines survive process boundaries and recover from corruption."""
 
-import gc
-import weakref
-from types import SimpleNamespace
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
+import numpy as np
 import pytest
-from tensoracle import CorruptEngineError, EngineConditionError, EngineIOError
 
 from listenflow.fastest_whisper._cached_model import CachedWhisper
-from listenflow.fastest_whisper._checkpoint import ModelConfig
+from native_runtime_fixture import encoded, record_engines
+
+pytestmark = [pytest.mark.gpu, pytest.mark.req("SP-LFFASTESTWHISPER-008")]
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-008")
-def test_encoder_and_decoder_keep_cache_identity_without_caller_rebuild(tmp_path, monkeypatch):
-    """Graph identities separate precisions and graph versions while retaining saved engines."""
-    from listenflow.fastest_whisper import _engines
-
-    monkeypatch.setattr(_engines, "_fc1_library", lambda: tmp_path / "fc1.so")
-
-    calls = []
-    graph_refs = []
-
-    class FakeGraph:
-        def __init__(self, network, checkpoint, precision):
-            graph_refs.append(weakref.ref(self))
-
-        def encoder(self):
-            pass
-
-        def decoder(self):
-            pass
-
-    monkeypatch.setattr(_engines, "_Graph", FakeGraph)
-
-    def open_stub(graph, declaration, **kwargs):
-        graph(None)
-        gc.collect()
-        assert graph_refs[-1]() is not None
-        calls.append((declaration, kwargs))
-        return SimpleNamespace(
-            engine=object(),
-            runtime=object(),
-            create_execution=lambda: SimpleNamespace(close=lambda: None),
-        )
-
-    monkeypatch.setattr(_engines, "open_engine", open_stub)
-    config = ModelConfig(128, 1500, 1280, 20, 5120, 32, 20, 5120, 32, 448, 51866)
-    checkpoint = SimpleNamespace(directory=tmp_path, config=config, weight_map=None)
-    model = object.__new__(CachedWhisper)
-    model.precision = "fp32"
-    model.logger = object()
-
-    model._open_engine(checkpoint, decoder=False)
-    model._open_engine(checkpoint, decoder=True)
-
-    assert [call[1]["name"] for call in calls] == [
-        "listenflow-fastest-whisper-encoder",
-        "listenflow-fastest-whisper-decoder",
-    ]
-    original_versions = _engines._GRAPH_VERSION
-    changed_versions = {"encoder": "encoder-next", "decoder": "decoder-next"}
-    monkeypatch.setattr(_engines, "_GRAPH_VERSION", changed_versions)
-    model._open_engine(checkpoint, decoder=False)
-    model._open_engine(checkpoint, decoder=True)
-    assert all(
-        original[1]["graph_version"] != changed[1]["graph_version"]
-        for original, changed in zip(calls[:2], calls[-2:], strict=True)
-    )
-    assert all(not call[1].get("force_rebuild", False) for call in calls)
-    assert all(
-        call[1]["weights"]
-        == [tmp_path / "config.json", tmp_path / "model.safetensors"]
-        + ([tmp_path / "tokenizer.json"] if index % 2 else [])
-        for index, call in enumerate(calls)
-    )
-    assert calls[0][0].inputs["mel"].minimum == (1, 128, 3000)
-    assert calls[1][0].inputs["tokens"].maximum == (1, 1)
-    assert calls[1][0].inputs["self_keys"].minimum == (32, 1, 20, 1, 64)
-    assert calls[1][0].inputs["self_keys"].maximum == (32, 1, 20, 448, 64)
-    assert calls[1][0].inputs["cross_values"].maximum == (32, 1, 20, 1500, 64)
-    assert set(calls[0][1]["io"].outputs) == {"encoder", "cross_keys", "cross_values"}
-    assert calls[1][1]["io"].outputs["logits"].shape == (1, 1, 51866)
-    assert calls[1][1]["io"].outputs["greedy"].shape == (1, 1, 3)
-
-    monkeypatch.setattr(_engines, "_GRAPH_VERSION", original_versions)
-    model.precision = "fp16"
-    model._open_engine(checkpoint, decoder=False)
-    model._open_engine(checkpoint, decoder=True)
-    for fp32, fp16 in zip(calls[:2], calls[-2:], strict=True):
-        assert (fp32[1]["name"], fp32[1]["graph_version"]) != (
-            fp16[1]["name"],
-            fp16[1]["graph_version"],
-        )
-
-
-@pytest.mark.req("SP-LFFASTESTWHISPER-008")
-@pytest.mark.parametrize("graph", ["mel", "encoder", "decoder", "sampled_decoder"])
-@pytest.mark.parametrize("error_type", [CorruptEngineError, EngineConditionError, EngineIOError])
-def test_unusable_saved_graph_is_rebuilt_once(tmp_path, monkeypatch, graph, error_type):
-    """Each damaged or incompatible graph is rebuilt while keeping its cache identity."""
-    from listenflow.fastest_whisper import _engines
-
-    calls = []
-    handle = SimpleNamespace(create_execution=lambda: SimpleNamespace(close=lambda: None))
-    monkeypatch.setattr(_engines, "_fc1_library", lambda: tmp_path / "fc1.so")
-
-    def open_native(*args, **kwargs):
-        calls.append((args, kwargs))
-        if not kwargs.get("force_rebuild", False):
-            raise error_type("saved graph cannot be opened")
-        return handle
-
-    monkeypatch.setattr(_engines, "open_engine", open_native)
-    config = ModelConfig(128, 1500, 1280, 20, 5120, 32, 20, 5120, 32, 448, 51866)
-    checkpoint = SimpleNamespace(directory=tmp_path, config=config, weight_map=None)
-    model = object.__new__(CachedWhisper)
-    model.precision = "fp16"
-    model.logger = object()
-    if graph == "mel":
-        actual = model._open_mel(checkpoint)
-    elif graph == "sampled_decoder":
-        actual = model._open_sampled_engine(checkpoint, batch_size=5)
-    else:
-        actual = model._open_engine(checkpoint, decoder=graph == "decoder")
-
-    assert actual is handle
-    assert len(calls) == 2
-    assert not calls[0][1].get("force_rebuild", False)
-    retry_args, retry_kwargs = calls[1]
-    assert retry_kwargs.pop("force_rebuild") is True
-    original_args, original_kwargs = calls[0]
-    original_kwargs.pop("force_rebuild", False)
-    assert (retry_args, retry_kwargs) == (original_args, original_kwargs)
-
-
-@pytest.mark.req("SP-LFFASTESTWHISPER-008")
-def test_sampled_candidate_batch_never_reuses_the_greedy_or_other_batch_engine(
-    tmp_path, monkeypatch
+def test_encoder_and_decoder_keep_cache_identity_in_another_process(
+    native_checkpoint, native_model
 ):
-    """Sampled decoders separate batch sizes and precisions without invalidating greedy plans."""
-    from listenflow.fastest_whisper import _engines
+    """A fresh process reuses all three saved engines without rewriting their files."""
+    paths = native_model._native_model.info["engine_paths"]
+    before = {
+        name: (Path(path).stat().st_ino, hashlib.sha256(Path(path).read_bytes()).hexdigest())
+        for name, path in paths.items()
+    }
+    expected = np.asarray(encoded(native_model)).sum().item()
+    code = """
+import json, sys, numpy as np
+from pathlib import Path
+from listenflow.fastest_whisper._cached_model import CachedWhisper
+with CachedWhisper(Path(sys.argv[1])) as model:
+    audio = model.encode(np.zeros((80, 3000), np.float32))
+    print(json.dumps({'paths': model._native_model.info['engine_paths'], 'sum': np.asarray(audio).sum().item()}))
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(native_checkpoint)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    actual = json.loads(result.stdout.splitlines()[-1])
+    assert actual["paths"] == paths
+    assert actual["sum"] == expected
+    after = {
+        # tensoracle records cache hits in mtime; an actual write atomically
+        # replaces the inode. Preserve both inode and serialized bytes here.
+        name: (Path(path).stat().st_ino, hashlib.sha256(Path(path).read_bytes()).hexdigest())
+        for name, path in paths.items()
+    }
+    assert after == before
 
-    monkeypatch.setattr(_engines, "_fc1_library", lambda: tmp_path / "fc1.so")
-    calls = []
 
-    def open_native(*args, **kwargs):
-        calls.append((args, kwargs))
-        return SimpleNamespace(create_execution=lambda: SimpleNamespace(close=lambda: None))
-
-    monkeypatch.setattr(_engines, "open_engine", open_native)
-    config = ModelConfig(128, 1500, 1280, 20, 5120, 32, 20, 5120, 32, 448, 51866)
-    checkpoint = SimpleNamespace(directory=tmp_path, config=config, weight_map=None)
-    for precision, batch in [("fp32", None), ("fp32", 2), ("fp32", 5), ("fp16", 5)]:
-        _engines.open_whisper_engine(
-            checkpoint, decoder=True, precision=precision, logger=None, sample_batch=batch
-        )
-    assert calls[0][1]["name"] == "listenflow-fastest-whisper-decoder"
-    assert calls[0][1]["graph_version"] == "5-fp32"
-    assert len({(kw["name"], kw["graph_version"]) for _, kw in calls}) == 4
-    for (args, kwargs), batch in zip(calls[1:], (2, 5, 5), strict=True):
-        assert args[1].inputs["tokens"].maximum == (batch, 1)
-        assert args[1].inputs["self_keys"].maximum == (32, batch, 20, 448, 64)
-        assert kwargs["io"].outputs["sampled"].shape == (batch, 1, 3)
-        assert "uniform" in args[1].inputs
-
-
-@pytest.mark.req("SP-LFFASTESTWHISPER-008")
-@pytest.mark.parametrize(
-    "failure",
-    [CorruptEngineError("rebuilt graph is invalid"), RuntimeError("building graph failed")],
-)
-def test_failed_rebuild_is_not_retried_again(tmp_path, monkeypatch, failure):
-    """A rebuild failure escapes unchanged after one attempt rather than looping."""
-    from listenflow.fastest_whisper import _engines
-
-    calls = []
-
-    def open_native(*args, **kwargs):
-        calls.append(kwargs.get("force_rebuild", False))
-        if calls[-1]:
-            raise failure
-        raise CorruptEngineError("saved graph is invalid")
-
-    monkeypatch.setattr(_engines, "open_engine", open_native)
-    checkpoint = SimpleNamespace(directory=tmp_path, config=SimpleNamespace(n_mels=128))
-    model = object.__new__(CachedWhisper)
-    model.precision = "fp16"
-    model.logger = object()
-    with pytest.raises(type(failure)) as caught:
-        model._open_mel(checkpoint)
-    assert caught.value is failure
-    assert calls == [False, True]
+def test_corrupt_saved_graph_recovers_without_a_caller_option(native_checkpoint, native_model):
+    """A damaged saved encoder is rebuilt once before native inference is returned."""
+    paths = native_model._native_model.info["engine_paths"]
+    native_model.close()
+    path = Path(paths["encoder"])
+    path.write_bytes(b"invalid native cache fixture")
+    with CachedWhisper(native_checkpoint) as recovered:
+        record_engines(native_checkpoint, recovered)
+        assert np.isfinite(np.asarray(encoded(recovered))).all()
+        assert recovered._native_model.info["engine_paths"]["encoder"] == str(path)
+        assert path.read_bytes() != b"invalid native cache fixture"

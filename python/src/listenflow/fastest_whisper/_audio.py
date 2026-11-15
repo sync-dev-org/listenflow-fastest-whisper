@@ -1,13 +1,12 @@
 """CPU preparation of 16 kHz mono audio for a 30-second Whisper encoder input."""
 
-from pathlib import Path
-
 import numpy as np
+
+from ._assets import MEL_FILTERS as _FILTERS
 
 N_SAMPLES = 480_000
 FFT_SIZE = 400
 HOP_SIZE = 160
-_FILTERS = Path(__file__).parent / "assets" / "mel_filters.npz"
 
 
 def log_mel_spectrogram(audio: np.ndarray, *, n_mels: int) -> np.ndarray:

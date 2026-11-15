@@ -4,7 +4,7 @@ Run from a standalone checkout with ``uv run --group evaluation python -m
 scripts.profile_latency --checkpoint-dir PATH --manifest PATH --output-dir PATH``.
 The default selects the first 50 test-clean utterances in each duration band,
 preserving manifest order. Model loading, warmup, audio reading and report writing
-are outside utterance timings. CUDA events bracket tensoracle enqueue on its own
+are outside utterance timings. CUDA events bracket native enqueue or replay on its own
 stream; host time is wall time minus enqueue GPU time, including copies, buffer
 management, Python token selection and profiling overhead. It is not CPU busy time.
 This diagnostic does not acquire exclusive GPU access (排他なし).
@@ -22,217 +22,143 @@ import statistics
 import subprocess
 import time
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 
 BANDS = ("0-5", "5-10", "10-20", "20-30")
 COMPONENTS = ("mel", "encoder", "decoder_gpu", "decoder_host", "other")
 SAMPLE_RATE = 16_000
 MAX_FRAMES = 30 * SAMPLE_RATE
-_MISSING = object()
+
+
+def diagnostic_session(flags=7):
+    """Load the development extension only when a caller requests observation."""
+    try:
+        from _lffw_diagnostics import Session
+    except ImportError as error:
+        raise RuntimeError(
+            "Build python/ with -DLFFW_RUNTIME_DIAGNOSTICS=ON and add its build directory "
+            "to PYTHONPATH before running native diagnostics"
+        ) from error
+    return Session(flags)
+
+
+def capture_native(function, *, flags=7):
+    """Observe a synchronous product call and always detach the session."""
+    session = diagnostic_session(flags)
+    try:
+        with session:
+            result = function()
+        return result, session.records
+    finally:
+        session.close()
 
 
 class DecoderProfiler:
-    """Temporarily instrument one sequential model without changing its decoding.
+    """Read native timing spans while the real product chooses its tokens."""
 
-    Enqueue interception is process-wide while this context is open; run one model
-    on one thread. Events are pooled outside utterance timings and read after the
-    normal inference synchronization, without adding a synchronization per enqueue.
-    This also observes executions created later by a cached decoder session.
-    """
-
-    def __init__(self, model, cudart, *, clock=time.perf_counter):
-        self.model, self.cudart, self.clock = model, cudart, clock
-        self.events = []
-        self.active = False
-        self.used = []
-        self.step_walls = []
-        self.step_started = None
-        self.buckets = []
-
-    def _cuda(self, result, operation):
-        if result[0] != self.cudart.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"{operation} failed: {result[0]}")
-        return result[1] if len(result) > 1 else None
-
-    def _create_pair(self):
-        start = self._cuda(self.cudart.cudaEventCreate(), "cudaEventCreate")
-        try:
-            stop = self._cuda(self.cudart.cudaEventCreate(), "cudaEventCreate")
-        except BaseException:
-            self._cuda(self.cudart.cudaEventDestroy(start), "cudaEventDestroy")
-            raise
-        self.events.append((start, stop))
+    def __init__(self, model, cudart=None, *, clock=time.perf_counter):
+        self.model, self.clock = model, clock
+        self.session = None
 
     def __enter__(self):
-        from tensoracle import EngineExecution
-
-        from listenflow.fastest_whisper._inference import _HostIO
-
-        self.execution_type = _HostIO if hasattr(_HostIO, "_enqueue") else EngineExecution
-        self.enqueue_name = "_enqueue" if self.execution_type is _HostIO else "enqueue"
-        self.original_enqueue = getattr(self.execution_type, self.enqueue_name)
-        self.original_methods = {
-            name: getattr(self.model, name)
-            for name in ("logits", "_greedy_step")
-            if hasattr(self.model, name)
-        }
-        self.instance_methods = {
-            name: self.model.__dict__.get(name, _MISSING) for name in self.original_methods
-        }
-        try:
-            # Enough for two enqueues per generated token; grows if a later graph needs more.
-            for _ in range(self.model.config.text_positions):
-                self._create_pair()
-
-            def enqueue(execution, addresses, *, stream):
-                if not self.active:
-                    return self.original_enqueue(execution, addresses, stream=stream)
-                index = len(self.used)
-                if index == len(self.events):
-                    self._create_pair()
-                start, stop = self.events[index]
-                self._cuda(self.cudart.cudaEventRecord(start, stream), "cudaEventRecord start")
-                result = self.original_enqueue(execution, addresses, stream=stream)
-                self._cuda(self.cudart.cudaEventRecord(stop, stream), "cudaEventRecord stop")
-                self.used.append((len(self.step_walls), start, stop))
-                self.buckets.append(execution.execution.get_tensor_shape("self_keys")[-2])
-                return result
-
-            def instrument(original):
-                def step(*args, **kwargs):
-                    if self.active:
-                        now = self.clock()
-                        if self.used:
-                            self.step_walls.append(now - self.step_started)
-                            self.step_started = now
-                    return original(*args, **kwargs)
-
-                return step
-
-            setattr(self.execution_type, self.enqueue_name, enqueue)
-            for name, original in self.original_methods.items():
-                setattr(self.model, name, instrument(original))
-        except BaseException:
-            self.__exit__(None, None, None)
-            raise
+        self.session = diagnostic_session()
         return self
 
     def __exit__(self, *_exc):
-        self.active = False
-        setattr(self.execution_type, self.enqueue_name, self.original_enqueue)
-        for name, original in self.instance_methods.items():
-            if original is _MISSING:
-                self.model.__dict__.pop(name, None)
-            else:
-                setattr(self.model, name, original)
-        try:
-            self._cuda(self.cudart.cudaDeviceSynchronize(), "cudaDeviceSynchronize")
-        finally:
-            pairs, self.events = self.events, []
-            for pair in pairs:
-                for event in pair:
-                    self._cuda(self.cudart.cudaEventDestroy(event), "cudaEventDestroy")
+        if self.session is not None:
+            self.session.close()
+            self.session = None
 
-    def measure(self, row: dict[str, str], samples) -> dict:
-        """Time from prepared waveform to full text and completed GPU work."""
-        from listenflow.fastest_whisper._audio import log_mel_spectrogram
+    def measure(self, row, samples):
+        from contextlib import ExitStack
+        from unittest.mock import patch
 
-        self._cuda(self.cudart.cudaDeviceSynchronize(), "cudaDeviceSynchronize")
-        self.used, self.step_walls, self.buckets = [], [], []
-        started = self.clock()
-        if hasattr(self.model, "transcribe"):
-            from unittest.mock import patch
+        starts, boundaries = [], {}
+        original_step = self.model._greedy_step
+        original_mel, original_encode = self.model._mel_spectrogram, self.model.encode
 
-            boundaries = {}
-            original_mel, original_encode = self.model._mel_spectrogram, self.model.encode
-            original_decode = self.model.decode_short
+        def step(*args, **kwargs):
+            starts.append(round(self.clock() * 1e9))
+            return original_step(*args, **kwargs)
 
-            def mel_stage(*args, **kwargs):
-                result = original_mel(*args, **kwargs)
-                boundaries["mel"] = self.clock()
-                return result
+        def mel(*args, **kwargs):
+            result = original_mel(*args, **kwargs)
+            boundaries["mel"] = round(self.clock() * 1e9)
+            return result
 
-            def encoder_stage(*args, **kwargs):
-                result = original_encode(*args, **kwargs)
-                boundaries["encoder"] = self.clock()
-                self.active = True
-                self.step_started = boundaries["encoder"]
-                return result
+        def encode(*args, **kwargs):
+            result = original_encode(*args, **kwargs)
+            boundaries["encoder"] = round(self.clock() * 1e9)
+            return result
 
-            def decode_stage(*args, **kwargs):
-                result = original_decode(*args, **kwargs)
-                boundaries["transcription"] = result
-                return result
+        def decode(*args, **kwargs):
+            result = original_decode(*args, **kwargs)
+            boundaries["transcription"] = result
+            return result
 
-            try:
-                with (
-                    patch.object(self.model, "_mel_spectrogram", mel_stage),
-                    patch.object(self.model, "encode", encoder_stage),
-                    patch.object(self.model, "decode_short", decode_stage),
-                ):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(self.model, "_greedy_step", step))
+            stack.enter_context(patch.object(self.model, "_mel_spectrogram", mel))
+            stack.enter_context(patch.object(self.model, "encode", encode))
+            if hasattr(self.model, "transcribe"):
+                original_decode = self.model.decode_short
+                stack.enter_context(patch.object(self.model, "decode_short", decode))
+            with self.session:
+                started = round(self.clock() * 1e9)
+                if hasattr(self.model, "transcribe"):
                     segments = self.model.transcribe(samples, beam_size=1, temperature=0, best_of=1)
-                transcription = boundaries["transcription"]
-                if " ".join(segment.text for segment in segments) != transcription.text:
-                    raise RuntimeError("product segments differ from decoder text")
-            finally:
-                self.active = False
-            mel_finished, encoder_finished = boundaries["mel"], boundaries["encoder"]
-            entrypoint = "CachedWhisper.transcribe"
-        else:
-            mel = (
-                self.model._mel_spectrogram(samples)
-                if getattr(self.model, "_mel", None) is not None
-                else log_mel_spectrogram(samples, n_mels=self.model.config.n_mels)
-            )
-            mel_finished = self.clock()
-            encoder = self.model.encode(mel)
-            encoder_finished = self.clock()
-            self.active = True
-            self.step_started = encoder_finished
-            try:
-                transcription = self.model.greedy_decode(encoder)
-            finally:
-                self.active = False
-            entrypoint = "TensorRTWhisper.greedy_decode"
-        decode_finished = self.clock()
-        self.step_walls.append(decode_finished - self.step_started)
-        self._cuda(self.cudart.cudaDeviceSynchronize(), "cudaDeviceSynchronize")
-        finished = self.clock()
-        if not self.used:
-            raise RuntimeError("decoder did not use tensoracle enqueue; GPU timing unavailable")
-        gpu_times = [0.0] * len(self.step_walls)
-        enqueue_times = []
-        for step, start, stop in self.used:
-            elapsed = (
-                self._cuda(self.cudart.cudaEventElapsedTime(start, stop), "cudaEventElapsedTime")
-                / 1000
-            )
-            gpu_times[step] += elapsed
-            enqueue_times.append(elapsed)
-        steps = []
-        for wall, gpu in zip(self.step_walls, gpu_times, strict=True):
+                    transcription = boundaries["transcription"]
+                    if " ".join(segment.text for segment in segments) != transcription.text:
+                        raise RuntimeError("product segments differ from decoder text")
+                    entrypoint = "CachedWhisper.transcribe"
+                else:
+                    transcription = self.model.greedy_decode(
+                        self.model.encode(self.model._mel_spectrogram(samples))
+                    )
+                    entrypoint = "TensorRTWhisper.greedy_decode"
+                finished = round(self.clock() * 1e9)
+        records = self.session.records
+        operations = [item for item in records if item["name"] == "lffw_greedy_step"]
+        if not operations or not starts:
+            raise RuntimeError("decoder executed no timed native token steps")
+        times = [boundaries["encoder"], *starts[1:], finished]
+        steps, buckets = [], []
+        for lower, upper in pairwise(times):
+            spans = [
+                span
+                for operation in operations
+                if lower <= operation["start_ns"] < upper
+                for span in operation["spans"]
+                if span["phase"] == "enqueue"
+            ]
+            if any(span["gpu_ms"] is None for span in spans):
+                raise RuntimeError("native decoder timing events are unavailable")
+            gpu = sum(span["gpu_ms"] / 1000 for span in spans)
+            wall = (upper - lower) / 1e9
             if gpu <= 0 or gpu > wall + 1e-6:
-                raise RuntimeError("decoder CUDA timing is inconsistent with wall time")
-            steps.append({"gpu_seconds": min(wall, gpu), "host_seconds": max(0.0, wall - gpu)})
+                raise RuntimeError("native GPU timing is inconsistent with host wall time")
+            steps.append({"gpu_seconds": min(gpu, wall), "host_seconds": max(0.0, wall - gpu)})
+            buckets.extend(
+                {"bucket": span["bucket"], "gpu_seconds": span["gpu_ms"] / 1000} for span in spans
+            )
         return {
             "id": row["id"],
             "frames": int(row["frames"]),
-            "total_seconds": finished - started,
-            "mel_seconds": mel_finished - started,
-            "encoder_seconds": encoder_finished - mel_finished,
-            "decoder_gpu_seconds": sum(step["gpu_seconds"] for step in steps),
-            "decoder_host_seconds": sum(step["host_seconds"] for step in steps),
-            "other_seconds": finished - decode_finished,
+            "total_seconds": (finished - started) / 1e9,
+            "mel_seconds": (boundaries["mel"] - started) / 1e9,
+            "encoder_seconds": (boundaries["encoder"] - boundaries["mel"]) / 1e9,
+            "decoder_gpu_seconds": sum(item["gpu_seconds"] for item in steps),
+            "decoder_host_seconds": sum(item["host_seconds"] for item in steps),
+            "other_seconds": 0.0,
             "decoder_steps": steps,
-            "decoder_enqueues": len(self.used),
+            "decoder_enqueues": len(buckets),
             "entrypoint": entrypoint,
-            "decoder_buckets": [
-                {"bucket": bucket, "gpu_seconds": gpu}
-                for bucket, gpu in zip(self.buckets, enqueue_times, strict=True)
-            ],
+            "decoder_buckets": buckets,
             "generated_tokens": len(transcription.tokens),
             "tokens": transcription.tokens,
             "output": transcription.text,
+            "native_operations": records,
         }
 
 
@@ -396,7 +322,6 @@ def run(checkpoint_dir: Path, manifest: Path, output_dir: Path, *, per_band: int
     """Build once, warm once, and record each of the selected utterances once."""
     from scripts.benchmark_latency import (
         _cache_engine_hashes,
-        _gpu_field,
         _gpu_sample,
         _load_waveform,
     )
@@ -407,8 +332,6 @@ def run(checkpoint_dir: Path, manifest: Path, output_dir: Path, *, per_band: int
     names = ("report.json", "report.md", "utterances.jsonl", "utterances.jsonl.partial")
     if any((output_dir / name).exists() for name in names):
         raise FileExistsError("profile output already exists; use a fresh output directory")
-
-    from cuda.bindings import runtime as cudart
 
     from listenflow.fastest_whisper._cached_model import CachedWhisper
 
@@ -434,8 +357,6 @@ def run(checkpoint_dir: Path, manifest: Path, output_dir: Path, *, per_band: int
         },
         "gpu_exclusive": False,
         "gpu_access": "排他なし",
-        "gpu": _gpu_field("name"),
-        "driver": _gpu_field("driver_version"),
         "python": platform.python_version(),
         "platform": platform.platform(),
         "versions": {
@@ -443,15 +364,15 @@ def run(checkpoint_dir: Path, manifest: Path, output_dir: Path, *, per_band: int
             for name in ("tensoracle", "tensorrt-cu13", "numpy", "cuda-python")
         },
         "timing": {
-            "total": "prepared waveform to full text and cudaDeviceSynchronize completion",
+            "total": "prepared waveform to full text after native completion polling",
             "mel": "log-mel wall time, including its transfers",
             "encoder": "encode wall time, including its I/O and any decoder preparation",
-            "decoder_gpu": "CUDA events before/after each tensoracle enqueue on its stream; "
+            "decoder_gpu": "CUDA events before/after native enqueue/replay on its stream; "
             "includes any device idle gaps during host submission",
             "decoder_host": "GPU の計算以外の残余: decode wall time minus enqueue event spans; "
             "includes allocations, frees, transfers, Python/NumPy selection and text assembly; "
             "not CPU busy time",
-            "other": "final device synchronization and surrounding Python overhead",
+            "other": "host work outside the recorded stages; no extra device synchronization",
             "step": "one _greedy_step call and following token handling until next _greedy_step call; "
             "first step includes prefix setup and last includes text assembly",
             "step_count": "number of _greedy_step calls, including the call that selects EOT",
@@ -465,6 +386,9 @@ def run(checkpoint_dir: Path, manifest: Path, output_dir: Path, *, per_band: int
     }
     rows = []
     metadata["gpu_before_load"] = _gpu_sample(0)
+    metadata["gpu"] = metadata["gpu_before_load"]["name"]
+    metadata["driver"] = metadata["gpu_before_load"]["driver_version"]
+    metadata["gpu_observations"] = [metadata["gpu_before_load"]]
     metadata["engine_sha256_before_load"] = _cache_engine_hashes()
     load_started = time.perf_counter()
     with CachedWhisper(checkpoint_dir, precision="fp16", device=0) as model:
@@ -474,11 +398,10 @@ def run(checkpoint_dir: Path, manifest: Path, output_dir: Path, *, per_band: int
         metadata["decode"]["suppressed_tokens"] = sorted(model.suppressed)
         metadata["decode"]["begin_suppressed_tokens"] = sorted(model.begin_suppressed)
         first_samples = _load_waveform(selected[0])
-        with DecoderProfiler(model, cudart) as profiler:
+        with DecoderProfiler(model) as profiler:
             warmup = profiler.measure(selected[0], first_samples)
             metadata["warmup_utterance_id"] = selected[0]["id"]
             metadata["warmup_seconds"] = warmup["total_seconds"]
-            metadata["gpu_observations"] = [_gpu_sample(0)]
             partial = output_dir / "utterances.jsonl.partial"
             with partial.open("x", encoding="utf-8") as stream:
                 for index, row in enumerate(selected, 1):
@@ -488,8 +411,8 @@ def run(checkpoint_dir: Path, manifest: Path, output_dir: Path, *, per_band: int
                     stream.write(json.dumps(observation, allow_nan=False) + "\n")
                     stream.flush()
                     if index % 25 == 0 or index == len(selected):
-                        metadata["gpu_observations"].append(_gpu_sample(index))
                         print(f"profile: {index}/{len(selected)}", flush=True)
+            metadata["gpu_observations"].append(_gpu_sample(len(selected)))
             partial.rename(output_dir / "utterances.jsonl")
         metadata["engine_sha256_after_measurement"] = _cache_engine_hashes()
     metadata["finished_at"] = datetime.now(UTC).isoformat()

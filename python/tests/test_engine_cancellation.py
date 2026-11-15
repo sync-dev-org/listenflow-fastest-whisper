@@ -18,18 +18,48 @@ from listenflow import (
 )
 from listenflow.fastest_whisper import FastestWhisperEngine
 from listenflow.fastest_whisper._cached_model import CachedWhisper
-from listenflow.fastest_whisper._inference import _HostIO
 
 
 @pytest.fixture
 def token_runtime(monkeypatch):
-    """Only native execution and model construction are replaced, never decode loops."""
-    from listenflow.fastest_whisper import _cached_model, _engine
+    """Block the native token call while keeping real CPU decode and cancellation loops."""
+    from listenflow.fastest_whisper import _cached_model
 
-    started = threading.Event()
-    release = threading.Event()
-    blocking = threading.Event()
+    started, release, blocking = threading.Event(), threading.Event(), threading.Event()
     decoder_calls = []
+
+    def execute(token):
+        if blocking.is_set():
+            decoder_calls.append([token])
+            if not started.is_set():
+                started.set()
+                assert release.wait(5), "test did not release native inference"
+        logits = np.full(11, -10.0, np.float32)
+        logits[0] = 10
+        return logits
+
+    class Prefix:
+        def close(self):
+            pass
+
+    class Decoder:
+        def prefix_step(self, parent, token):
+            return Prefix(), execute(token)
+
+        def greedy_step(self, token, first, score):
+            logits = execute(token)
+            normalizer = np.logaddexp.reduce(logits)
+            return 0, float(logits[0] - normalizer), float(np.exp(logits[7] - normalizer))
+
+        def close(self):
+            pass
+
+    class Encoder:
+        def decoder(self, kind, batch=1):
+            return Decoder()
+
+        def close(self):
+            pass
 
     class Model(CachedWhisper):
         def __init__(self, *args, **kwargs):
@@ -46,8 +76,7 @@ def token_runtime(monkeypatch):
             self.precision = "fp32"
             self.initial_tokens = [1, 2, 4, 5]
             self.eot = 3
-            self.suppressed = set()
-            self.begin_suppressed = set()
+            self.suppressed, self.begin_suppressed = set(), set()
             self.tokenizer = Tokenizer(
                 models.WordLevel(
                     vocab={
@@ -66,52 +95,25 @@ def token_runtime(monkeypatch):
                     unk_token="word",
                 )
             )
-            self._encoder = _HostIO.__new__(_HostIO)
-            self._decoder = _HostIO.__new__(_HostIO)
-            self._decoder.outputs = ("token", "logits", "present_keys", "present_values")
-            self._mel = _HostIO.__new__(_HostIO)
+            self._native_model = SimpleNamespace(close=lambda: None)
+            self._mel_tensor = self._encoded_audio = None
+            self._prefix_decoder = self._greedy_decoder = None
+            self._prefix_states, self._root_prefix, self._greedy_length = {}, (), 0
+            self._sampled_decoder = None
 
-    def execute(_self, inputs, *, device_outputs=(), reuse_cache=False):
-        if "audio" in inputs:
-            from listenflow.fastest_whisper._audio import log_mel_spectrogram
+        def _mel_spectrogram(self, audio):
+            return np.zeros((128, 3000), np.float32)
 
-            mel = log_mel_spectrogram(inputs["audio"][200:-200], n_mels=128)
-            return {"mel": mel, "log_mel": mel * 4 - 4}
-        if "mel" in inputs:
-            return {
-                "encoder": np.zeros((1, 2, 4), dtype=np.float32),
-                "cross_keys": np.zeros((1, 1, 1, 2, 4), dtype=np.float32),
-                "cross_values": np.zeros((1, 1, 1, 2, 4), dtype=np.float32),
-            }
-        prefix = inputs["tokens"][0]
-        if blocking.is_set():
-            decoder_calls.append(prefix.tolist())
-            if not started.is_set():
-                started.set()
-                assert release.wait(5), "test did not release native inference"
-        logits = np.full((1, len(prefix), 11), -10.0, dtype=np.float32)
-        logits[0, -1, 0] = 10.0
-        cache = np.concatenate(
-            [inputs["self_keys"], np.zeros((1, 1, 1, 1, 4), dtype=np.float32)], axis=3
-        )
-        token = np.argmax(logits + inputs["suppression"], axis=-1).astype(np.int32)[..., None]
-        filtered = logits + inputs["suppression"]
-        logprob = filtered.max(axis=-1, keepdims=True) - np.logaddexp.reduce(
-            filtered, axis=-1, keepdims=True
-        )
-        silence = np.exp(logits[..., 7:8] - np.logaddexp.reduce(logits, axis=-1, keepdims=True))
-        return {
-            "logits": logits,
-            "present_keys": cache,
-            "present_values": cache.copy(),
-            "token": token,
-            "greedy": np.concatenate((token.astype(np.float32), logprob, silence), axis=-1),
-        }
+        def _mel_spectrogram_long(self, audio):
+            return np.zeros((128, audio.size // 160 + 3000), np.float32)
+
+        def encode(self, mel):
+            self._clear_prefix_states()
+            self._clear_greedy_cache()
+            self._encoded_audio = Encoder()
+            return self._encoded_audio
 
     monkeypatch.setattr(_cached_model, "CachedWhisper", Model)
-    monkeypatch.setattr(_HostIO, "run", execute)
-    monkeypatch.setattr(_HostIO, "close", lambda self: None)
-    monkeypatch.setattr(_engine, "_cuda_device_info", lambda device: (1, (12, 0)))
     try:
         yield started, release, blocking, decoder_calls
     finally:

@@ -9,9 +9,10 @@ from tensoracle.producer import compile_bundle
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cuda-root", type=Path, required=True, help="Conan CUDA toolkit root")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    manifest = compile_bundle(kernel_specs(), args.output_dir)
+    manifest = compile_bundle(kernel_specs(), args.output_dir, cuda_root=args.cuda_root.resolve())
     print(manifest["bundle_sha256"])
 
 

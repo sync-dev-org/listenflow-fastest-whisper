@@ -1,143 +1,94 @@
-"""GPU sampling frequencies and resident candidate batches using the real runtime."""
-
-import os
-from pathlib import Path
-from types import SimpleNamespace
+"""GPU sampling frequencies through the real native model's decoder interface."""
 
 import numpy as np
 import pytest
-import tensorrt as trt
 from scripts.evaluate_fp8_product import seeded_utterance
-from scripts.generate_oracle import read_pcm16_mono
-from tensoracle import BuilderSettings, EngineBuild, EngineIO, InputShape, TensorSpec, open_engine
 
+from listenflow.fastest_whisper import _native
 from listenflow.fastest_whisper._cached_model import CachedWhisper
 from listenflow.fastest_whisper._decoding import DecodingSettings
-from listenflow.fastest_whisper._inference import _HostIO
-from listenflow.fastest_whisper._network import _Graph
+from native_runtime_fixture import encoded, record_engines
 
 pytestmark = [pytest.mark.gpu, pytest.mark.req("SP-LFFASTESTWHISPER-002")]
-COUNT = 40_000
+COUNT, BATCH = 40000, 100
 
 
 @pytest.fixture(scope="module")
-def sampler():
-    if os.environ.get("LFFW_USE_GPU") != "1":
-        pytest.skip("set LFFW_USE_GPU=1 for GPU sampling checks")
-    shapes = {
-        "logits": (COUNT, 1, 6),
-        "suppression": (COUNT, 1, 6),
-        "temperature": (1, 1, 1),
-        "uniform": (COUNT, 1, 1),
-        "timestamps": (1, 1, 1),
-    }
-    owners = []
-
-    def define(network):
-        graph = _Graph(network, SimpleNamespace(config=SimpleNamespace(vocab_size=6)), "fp32")
-        owners.append(graph)
-        inputs = {
-            name: network.add_input(name, trt.bool if name == "timestamps" else trt.float32, shape)
-            for name, shape in shapes.items()
-        }
-        result = graph._sampling_result(**inputs, timestamp_begin=4, no_speech=5)
-        result.name = "sampled"
-        network.mark_output(result)
-
-    handle = open_engine(
-        define,
-        EngineBuild(
-            inputs={name: InputShape.fixed(shape) for name, shape in shapes.items()},
-            settings=BuilderSettings(workspace_limit=256 * 1024**2, tf32=False),
-        ),
-        name="lffw-test-sampling",
-        graph_version="1",
-        weights=[Path(__file__)],
-        io=EngineIO(
-            inputs={
-                name: TensorSpec(trt.bool if name == "timestamps" else trt.float32, shape)
-                for name, shape in shapes.items()
-            },
-            outputs={"sampled": TensorSpec(trt.float32, (COUNT, 1, 3))},
-        ),
-        logger=trt.Logger(trt.Logger.WARNING),
-    )
-    io = _HostIO(handle)
-    try:
-        yield io
-    finally:
-        io.close()
-
-
-@pytest.mark.parametrize("temperature", [0.2, 0.8, 2.0])
-def test_gpu_sampling_matches_softmax_with_six_sigma_bound_and_same_seed(sampler, temperature):
-    """GPU frequencies follow softmax, scores remain unscaled, and a repeated seed repeats tokens."""
-    row = np.array([1_000_000, 999_999.9375, 999_999.875, -np.inf, -np.inf, -np.inf], np.float32)
-    outputs = []
-    for _ in range(2):
-        inputs = {
-            "logits": np.tile(row, (COUNT, 1, 1)),
-            "suppression": np.zeros((COUNT, 1, 6), np.float32),
-            "temperature": np.full((1, 1, 1), temperature, np.float32),
-            "uniform": np.random.default_rng(421).random((COUNT, 1, 1), dtype=np.float32),
-            "timestamps": np.zeros((1, 1, 1), bool),
-        }
-        outputs.append(sampler.run(inputs)["sampled"])
-    np.testing.assert_array_equal(outputs[0], outputs[1])
-    tokens = outputs[0][:, 0, 0].astype(int)
-    weights = np.exp((row[:3].astype(np.float64) - row[0]) / temperature)
-    expected = weights / weights.sum()
-    counts = np.bincount(tokens, minlength=6)
-    assert not counts[3:].any()
-    assert np.all(
-        abs(counts[:3] - COUNT * expected) < 6 * np.sqrt(COUNT * expected * (1 - expected))
-    )
-    raw = row[:3].astype(np.float64) - row[0]
-    np.testing.assert_allclose(
-        outputs[0][:, 0, 1], (raw - np.log(np.exp(raw).sum()))[tokens], atol=3e-6
-    )
-
-
-@pytest.fixture(scope="module")
-def sampled_model():
-    checkpoint = os.environ.get("LFFW_CHECKPOINT_DIR")
-    if os.environ.get("LFFW_USE_GPU") != "1" or not checkpoint:
-        pytest.skip("set LFFW_USE_GPU=1 and LFFW_CHECKPOINT_DIR for candidate batch checks")
-    with CachedWhisper(Path(checkpoint), precision="fp16", settings=DecodingSettings()) as model:
+def sampler(native_checkpoint):
+    with CachedWhisper(
+        native_checkpoint, settings=DecodingSettings(temperatures=(0.4,), best_of=BATCH)
+    ) as model:
+        record_engines(native_checkpoint, model)
         yield model
 
 
-def test_prepared_gpu_batch_repeats_utterance_seed_without_logit_or_prefix_transfers(
-    sampled_model, monkeypatch
-):
-    """Prepared retries are reproducible and transfer only three scalar results per candidate."""
-    from cuda.bindings import runtime as cudart
-
-    model = sampled_model
-    samples = read_pcm16_mono(Path(__file__).parent / "fixtures/small_boat_16khz_mono_s16le.wav")
-    encoder = model.encode(model._mel_spectrogram(samples))
-    copies = []
-    native_copy = cudart.cudaMemcpyAsync
-
-    def copy(*args):
-        if args[3] == cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost:
-            copies.append(args[2])
-        return native_copy(*args)
-
-    def host_logits(*_args, **_kwargs):
-        pytest.fail("a prepared sampled retry transferred or stacked vocabulary logits")
-
-    monkeypatch.setattr(cudart, "cudaMemcpyAsync", copy)
-    monkeypatch.setattr(model, "logits", host_logits)
-    monkeypatch.setattr(np, "stack", host_logits)
-    results = []
-    for _ in range(2):
-        with seeded_utterance("sampled-batch-fixture"):
-            results.append(
-                model._decode_attempt(
-                    encoder, [], with_timestamps=False, temperature=0.4, beam_size=None, best_of=5
-                )
+@pytest.mark.parametrize("temperature", [0.2, 1.0])
+def test_gpu_sampling_matches_softmax_with_six_sigma_bound_and_same_seed(sampler, temperature):
+    """Native inverse-CDF draws match masked decoder probabilities and unscaled scores."""
+    audio = encoded(sampler)
+    token = sampler.initial_tokens[0]
+    raw = sampler.logits([token], audio)[-1].astype(np.float64)
+    kept = np.array([1, 2, 15])
+    suppression = np.full((BATCH, 16), -np.inf, np.float32)
+    suppression[:, kept] = 0
+    samples, scores = [], []
+    random = np.random.default_rng(61120)
+    for _ in range(COUNT // BATCH):
+        chain = audio.decoder(_native.SAMPLED, BATCH)
+        try:
+            selected, logprob, _ = chain.sampled_step(
+                np.full(BATCH, token, np.int32),
+                suppression,
+                temperature,
+                random.random(BATCH, dtype=np.float32),
+                False,
             )
-    assert results[0] == results[1]
-    assert copies and set(copies) == {5 * 3 * np.dtype(np.float32).itemsize}
-    assert len(model._sampled_decoder._graphs.entries) <= 16
+            samples.extend(selected)
+            scores.extend(logprob)
+        finally:
+            chain.close()
+    tokens = np.asarray(samples)
+    centered = raw[kept] - raw[kept].max()
+    expected = np.exp(centered / temperature)
+    expected /= expected.sum()
+    counts = np.array([(tokens == value).sum() for value in kept])
+    assert counts.sum() == COUNT
+    assert np.all(abs(counts - COUNT * expected) < 6 * np.sqrt(COUNT * expected * (1 - expected)))
+    logprobs = centered - np.log(np.exp(centered).sum())
+    observed = np.array([logprobs[np.flatnonzero(kept == value)[0]] for value in tokens])
+    np.testing.assert_allclose(scores, observed, atol=3e-6)
+    chain = audio.decoder(_native.SAMPLED, BATCH)
+    first_uniform = np.random.default_rng(61120).random(BATCH, dtype=np.float32)
+    try:
+        repeated, _, _ = chain.sampled_step(
+            np.full(BATCH, token, np.int32), suppression, temperature, first_uniform, False
+        )
+    finally:
+        chain.close()
+    np.testing.assert_array_equal(repeated, tokens[:BATCH])
+
+
+def test_prepared_gpu_batch_repeats_utterance_seed_without_logit_or_prefix_transfers(
+    native_checkpoint,
+):
+    """A prepared retry uses its resident audio and returns the same seeded token sequence."""
+    settings = DecodingSettings(
+        temperatures=(0.4,),
+        best_of=2,
+        no_speech_threshold=None,
+        compression_ratio_threshold=None,
+        logprob_threshold=None,
+    )
+    with CachedWhisper(native_checkpoint, settings=settings) as model:
+        record_engines(native_checkpoint, model)
+        audio = encoded(model)
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("prepared sampling requested raw host logits")
+
+        model.logits = forbidden
+        values = []
+        for _ in range(2):
+            with seeded_utterance("native-repeat"):
+                values.append(model.decode_short(audio, [], settings).tokens)
+        assert values[0] == values[1]

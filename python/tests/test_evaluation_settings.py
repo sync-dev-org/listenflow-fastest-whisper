@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import platform
 import sys
@@ -252,9 +253,9 @@ def cpu_tensor_rt(tmp_path, monkeypatch):
         model.begin_suppressed = set(model.tokenizer.encode(" ", add_special_tokens=False).ids)
         model.begin_suppressed.add(model.eot)
         model.build_seconds = 0.25
-        model._encoder = EncoderExecution()
-        model._decoder = DecoderExecution(precision)
-        model._mel = MelExecution()
+        from native_boundary import initialize_state
+
+        initialize_state(model, MelExecution(), EncoderExecution(), DecoderExecution(precision))
 
     # Only initialization of GPU engines and their execution are replaced. The
     # original context manager, encode, logits, tokenizer and decoders all run.
@@ -594,7 +595,7 @@ def test_wer_cli_passes_settings_and_keeps_default_csv_and_metadata(
             "checkpoint_sha256": {},
             "gpu": "cpu test",
             "driver": "cpu test",
-            "tensorrt": _inference.trt.__version__,
+            "tensorrt": importlib.metadata.version("tensorrt-cu13"),
             "python": platform.python_version(),
         }
         assert (

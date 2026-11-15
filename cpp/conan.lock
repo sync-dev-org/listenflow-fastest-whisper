@@ -1,0 +1,12 @@
+{
+    "version": "0.5",
+    "requires": [
+        "tensorrt/11.2.1.2#b13e1bf243c17a21d10b17d4a9469d9c",
+        "tensoracle/2.6.0#7b6a0f1572c2d5aacf186fdd7f965f22"
+    ],
+    "build_requires": [
+        "cuda-toolkit/13.2.2#610d7e3984f0fc4835768ab05d0c019b"
+    ],
+    "python_requires": [],
+    "config_requires": []
+}

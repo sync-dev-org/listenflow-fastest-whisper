@@ -1,9 +1,10 @@
 # listenflow-fastest-whisper
 
+
 `listenflow-fastest-whisper` is the standalone distribution for
 `listenflow.fastest_whisper`. Its current fp32 path builds the Whisper large-v3
-encoder and decoder directly from a Hugging Face checkpoint with TensorRT's Python
-network definition API. It does not load ONNX or distribute an engine or weights.
+encoder and decoder directly from a Hugging Face checkpoint with a C++ TensorRT
+network definition. It does not load ONNX or distribute an engine or weights.
 The numerical entry points establish a correctness reference. `FastestWhisperEngine`
 implements the listenflow stream contract and persists its TensorRT engines through
 tensoracle. It transcribes all 100 language codes supported by Whisper large-v3.
@@ -12,22 +13,31 @@ tensoracle. It transcribes all 100 language codes supported by Whisper large-v3.
 
 Requires Python 3.12 or 3.13 and Linux x86_64, including WSL2. The supported
 NVIDIA GPU compute capabilities are sm86, sm89, and sm120. The host supplies an
-NVIDIA driver compatible with CUDA 13. Package dependencies include
-`cuda-python>=13.0` and `tensorrt-cu13>=11.0`.
+NVIDIA driver compatible with CUDA 13 and TensorRT **11.2.1.2 or newer in the
+11.x series** (`libnvinfer.so.11`), the SDK version used for this build.
+An installed CUDA Toolkit is not required; CUDA runtime is linked statically.
 
-Install from PyPI:
+On Ubuntu or Debian, register the NVIDIA CUDA network apt repository for your
+OS using the [NVIDIA installation instructions](https://docs.nvidia.com/deeplearning/tensorrt/latest/installing-tensorrt/install-debian.html#installation-steps).
+Complete the repository/keyring setup and omit the CUDA Toolkit installation.
+Install the runtime libraries, including the matching builder resources:
 
 ```console
+sudo apt-get update
+sudo apt-get install tensorrt-libs
+dpkg-query -W libnvinfer11
 pip install listenflow-fastest-whisper
 ```
 
-The package installs listenflow core (`listenflow>=0.22.0`) and tensoracle from
-PyPI as normal dependencies.
+The package installs listenflow core (`listenflow>=0.22.0`) and tensoracle
+(`tensoracle>=2.6.0`) from PyPI. The native inference library reads the shared
+library supplied by the tensoracle wheel. TensorRT is supplied by the host's
+loader; the wheel contains no TensorRT libraries or TensorRT RUNPATH.
 
-The Linux wheel includes the native fc1 plugin and its sm86, sm89, and sm120
-cubins. Runtime installation does not require a TensorRT SDK, Triton, or the
-tensoracle producer. Source development requires the independent native build
-described in [the C++ build guide](https://github.com/sync-dev-org/listenflow-fastest-whisper/blob/main/cpp/README.md).
+The wheel contains the inference C ABI library, its nanobind extension, and the
+fc1 plugin with sm86, sm89, and sm120 cubins. Runtime installation needs no C++
+headers, Triton, or producer tools. Source development is described in
+[the C++ build guide](https://github.com/sync-dev-org/listenflow-fastest-whisper/blob/main/cpp/README.md).
 
 ## Use the engine
 
@@ -325,17 +335,78 @@ tests, and development scripts live in `python/`, with one environment at
 
 ```sh
 cd python
-uv sync --group dev --group evaluation
+uv sync --locked --no-install-project --group evaluation --group oracle --group cubin
 uv lock --check
-uv run --group dev --group evaluation pytest
-uv run --group dev ruff check
-uv run --group dev ruff format --check
 ```
 
 Run the remaining Python commands below from `python/`. The standalone C++ project
 in `cpp/` uses the host's CMake and Ninja and does not discover Python or nanobind.
 The Python project's README and license are symlinks to the repository's originals;
 source distributions include their contents as regular files.
+
+The default `dev` group installs `tensoracle[tensorrt]>=2.6.0` for tests and
+scripts that use the TensorRT Python binding. This development extra is absent
+from the package's runtime dependencies. The `cubin` group installs tensoracle
+without its producer extra. CUDA build
+tools come from the locked Conan `cuda-toolkit`, including NVRTC and cuobjdump.
+Before producing cubins or running their Python tests, run
+`cmake -P cpp/conan/prepare-tests.cmake` from the repository root and source
+`build/conan-prepare/conanbuild.sh`. Pass its `CUDAToolkit_ROOT` to
+`cpp/generate_cubin_bundle.py --cuda-root`. The first recipe download requires a
+host `gh` login with access to `sync-dev-org/conan-recipes`.
+
+### Native extension build
+
+The inference extension uses nanobind's CPython stable ABI, with Python 3.12 as
+the minimum. Build it separately for source development; release wheel metadata
+and Conan dependency preparation are handled by the release build.
+
+Run the following from `python/`, after preparing Conan dependencies and the
+cubin bundle described in `cpp/README.md`. Conan supplies the tensoracle and
+TensorRT SDKs and CUDA toolkit. Nanobind comes from the Python build requirements.
+CMake and Ninja must be on the host's PATH.
+
+```bash
+uv pip install nanobind==2.15.0
+cmake -S . -B ../build/python-native -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+  -DPython_EXECUTABLE="$PWD/.venv/bin/python" \
+  -DLFFW_BUNDLE_ROOT="$PWD/../build/cubin-bundle"
+cmake --build ../build/python-native --parallel 2
+cmake --install ../build/python-native --prefix "$PWD/src"
+LFFW_BUNDLE_ROOT="$PWD/../build/cubin-bundle" \
+  uv pip install --no-deps --reinstall-package listenflow-fastest-whisper .
+cmake -S . -B ../build/python-diagnostics -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DLFFW_RUNTIME_DIAGNOSTICS=ON \
+  -DPython_EXECUTABLE="$PWD/.venv/bin/python" \
+  -DLFFW_BUNDLE_ROOT="$PWD/../build/cubin-bundle"
+cmake --build ../build/python-diagnostics --parallel 2
+. ../build/conan-prepare/conanbuild.sh
+. ../build/conan-prepare/conanrun.sh
+uv run --locked --no-sync pytest -m 'not gpu'
+```
+
+This installs `_native.abi3.so`, `liblffw_runtime.so` and the fc1 plugin under the
+source package for pytest, and installs a native wheel into the venv for Python
+scripts. They use the same C++ sources and Conan lock. This namespace package is
+not installed as editable. Run `uv run --no-sync` after preparing dependencies;
+`uv sync --no-install-project` removes the installed project wheel. After syncing
+or changing source, repeat the native build, source install and wheel install.
+`uv sync` can also remove the build-only nanobind package, so install it again
+before reconfiguring. Tests that exercise evaluation
+tools also require the existing `evaluation`, `oracle` and `cubin` groups.
+The separate diagnostic build supplies the CPU profiler tests; it is not installed
+over the product runtime or included in wheels.
+
+The Conan run environment makes the prepared SDK libraries available for source
+tests. Installed wheels use an `$ORIGIN`-relative path to the tensoracle wheel;
+they leave TensorRT to the host loader. SDK library directories and build-host
+absolute paths are absent from the installed RUNPATH.
+
+The native mel filter asset is reproduced by
+`uv run --no-sync python scripts/prepare_mel_weights.py`. It contains exactly the
+filter values in `assets/mel_filters.npz`; the native reader uses safetensors.
+
 
 The evaluation group supplies the CPU libraries used by the reference and scoring
 tests. The ordinary test suite runs without a sibling checkout, checkpoint, or GPU.
@@ -345,7 +416,7 @@ the C++ guide. Release wheels use the pinned container and ELF checks in
 The model's `gpu` tests require `LFFW_USE_GPU=1` and `LFFW_CHECKPOINT_DIR` pointing
 to a usable local Hugging Face checkpoint. For cubin production and the standalone
 native plugin build, see [the C++ development guide](https://github.com/sync-dev-org/listenflow-fastest-whisper/blob/main/cpp/README.md). Its small GPU
-tests require a verified TensorRT SDK and `LFFW_USE_GPU=1`, without a Whisper
+tests require prepared Conan dependencies and `LFFW_USE_GPU=1`, without a Whisper
 checkpoint. Before using a shared GPU, coordinate its use
 with the host's shared-resource owner. Run GPU comparisons serially. Use a directory
 on disk for the checkout; cache checks create several GiB of engine files. GPU
@@ -356,7 +427,7 @@ directories and cache environment.
 
 ```sh
 LFFW_USE_GPU=1 LFFW_CHECKPOINT_DIR=/absolute/path/to/whisper-large-v3 \
-  uv run --group dev --group evaluation pytest tests/test_fp32_gpu.py -q
+  uv run --no-sync --group dev --group evaluation pytest tests/test_fp32_gpu.py -q
 ```
 
 Pytest removes the GPU run's directory, including its engine cache, when the run
@@ -365,8 +436,9 @@ or host crash can prevent cleanup; remove that run's directory manually once its
 processes have stopped. Concurrent runs use separate directories and leave each
 other's files alone.
 
-Plan disk and memory per GPU test file from the figures below, measured with one
-file per process on an RTX PRO 4000 Blackwell (sm120) with TensorRT 11.4. Disk is
+The following reference figures describe the Python execution workload, measured
+with one file per process on an RTX PRO 4000 Blackwell (sm120) with TensorRT 11.4.
+Use separate resource reservations for native C ABI workloads. Disk is
 the peak size of the run's temporary directory. Memory is the cgroup peak, which
 includes page cache; every file also passes with a 16 GiB memory limit and no swap.
 `python/tests/test_engine_gpu.py` holds two engine caches at once: the module's shared
@@ -384,12 +456,11 @@ Engine builds are slower on older generations. On an RTX A6000 (sm86),
 `python/tests/test_fp16_gpu.py` took 34 minutes, and the cache reuse and corruption check
 alone took 38 minutes.
 
-Outside pytest, the numerical comparison entries store encoder and decoder engines
-under `$XDG_CACHE_HOME/tensoracle/` (or `~/.cache/tensoracle/` when unset) and rebuild
-them on every model construction. Set `XDG_CACHE_HOME` to a directory on disk
-for those comparisons and remove the engine files after the run. Both the
-comparison entries and `FastestWhisperEngine` use tensoracle to build and execute
-the same graph declarations.
+Outside pytest, the numerical comparison entries and `FastestWhisperEngine` reuse
+the same native engine declarations and the configured default tensoracle cache.
+Damaged or incompatible saved engines are rebuilt automatically. Keep the cache
+configuration used by the application; release only recorded test-owned files
+when a standalone diagnostic run has finished.
 
 `transcribe_fp32(checkpoint_dir, audio)` accepts a one-dimensional NumPy array of
 16 kHz mono samples, normalized to floating-point values as PCM16 divided by
@@ -561,7 +632,7 @@ reference fixture, not a lasting decode policy for the module.
 Regenerate the reference with the already downloaded official file:
 
 ```sh
-uv run --group oracle python scripts/generate_oracle.py \
+uv run --no-sync --group oracle python scripts/generate_oracle.py \
   --checkpoint /absolute/path/to/large-v3.pt
 ```
 

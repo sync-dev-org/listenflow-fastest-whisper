@@ -1,6 +1,6 @@
 """Measure product fp8, fp16 and fp32 recognition and latency.
 
-Use a fresh disposable XDG_CACHE_HOME for each run. The latency mode requires an
+Use the existing GPU test wrapper for disposable storage. The latency mode requires an
 externally coordinated quiet interval and records its identifier; the script does
 not obtain exclusive resources. FP8 uses the calibration data shipped with the package.
 """
@@ -13,39 +13,20 @@ import importlib.metadata
 import json
 import os
 import platform
-import statistics
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-import numpy as np
-from cuda.bindings import runtime as cudart
 from scripts.benchmark_latency import _cache_engine_hashes, _gpu_sample, _load_waveform
 from scripts.evaluate_wer import EXPECTED_INCLUDED, checkpoint_hashes, read_csv, word_errors
-from scripts.profile_latency import DecoderProfiler, select_utterances, summarize
-from scripts.profile_layers import decoder_buckets
 
 from listenflow.fastest_whisper._audio import log_mel_spectrogram
 from listenflow.fastest_whisper._cached_model import CachedWhisper
 from listenflow.fastest_whisper._decoding import decoding_settings
-from listenflow.fastest_whisper._inference import _cuda, _DeviceTensor, _release_tensors
-from listenflow.fastest_whisper._precision import PRECISIONS
 
 
 class MeasuredWhisper(CachedWhisper):
-    """Measure preparation without changing product precision or graph selection."""
-
-    def _open_engine(self, checkpoint, *, decoder):
-        start = time.perf_counter()
-        result = super()._open_engine(checkpoint, decoder=decoder)
-        self.build_seconds["decoder" if decoder else "encoder"] = time.perf_counter() - start
-        return result
-
-    def _open_mel(self, checkpoint):
-        start = time.perf_counter()
-        result = super()._open_mel(checkpoint)
-        self.build_seconds["mel"] = time.perf_counter() - start
-        return result
+    """Expose the native preparation values without changing product selection."""
 
 
 def resource_sample(completed):
@@ -54,110 +35,142 @@ def resource_sample(completed):
     return sample
 
 
-def completed_run(io, inputs):
-    values = io.run(inputs, device_outputs=io.outputs)
-    try:
-        _cuda(cudart.cudaStreamSynchronize(io.stream), "trial stream synchronize")
-    finally:
-        _release_tensors(values)
+def completed_run(operation):
+    """Complete a product call and release any temporary native output it owns."""
+    result = operation()
+    if hasattr(result, "close"):
+        result.close()
+    return result
 
 
-def gpu_times(io, inputs, *, iterations, warmup=5):
-    """CUDA events around warmed product replay; transfers and host waiting are excluded."""
+def gpu_times(operation, *, iterations, warmup=1):
+    """Read only enqueue/replay CUDA times from synchronous native calls."""
+    import statistics
+
+    from scripts.profile_latency import capture_native
+
+    if iterations < 1 or warmup < 0:
+        raise ValueError("iterations must be positive and warmup nonnegative")
     for _ in range(warmup):
-        completed_run(io, inputs)
-    start = _cuda(cudart.cudaEventCreate(), "trial start event")
-    stop = _cuda(cudart.cudaEventCreate(), "trial stop event")
-    times = []
-    original = io._enqueue
-
-    def enqueue(addresses, *, stream):
-        _cuda(cudart.cudaEventRecord(start, stream), "trial event record")
-        result = original(addresses, stream=stream)
-        _cuda(cudart.cudaEventRecord(stop, stream), "trial event record")
-        return result
-
-    io._enqueue = enqueue
-    try:
-        for _ in range(iterations):
-            values = io.run(inputs, device_outputs=io.outputs)
-            try:
-                _cuda(cudart.cudaEventSynchronize(stop), "trial event synchronize")
-                times.append(_cuda(cudart.cudaEventElapsedTime(start, stop), "trial event time"))
-            finally:
-                _release_tensors(values)
-    finally:
-        del io._enqueue
-        _cuda(cudart.cudaEventDestroy(stop), "trial event destroy")
-        _cuda(cudart.cudaEventDestroy(start), "trial event destroy")
+        completed_run(operation)
+    values = []
+    for _ in range(iterations):
+        _, records = capture_native(lambda: completed_run(operation))
+        spans = [span for row in records for span in row["spans"] if span["phase"] == "enqueue"]
+        if not spans or any(span["gpu_ms"] is None for span in spans):
+            raise RuntimeError("native enqueue timing is unavailable")
+        values.append(sum(span["gpu_ms"] for span in spans))
+    ordered = sorted(values)
+    offset = (len(ordered) - 1) * 0.95
+    low = int(offset)
     return {
-        "samples_ms": times,
-        "median_ms": statistics.median(times),
-        "p95_ms": float(np.percentile(times, 95)),
+        "samples_ms": values,
+        "median_ms": statistics.median(values),
+        "p95_ms": ordered[low]
+        + (ordered[min(low + 1, len(ordered) - 1)] - ordered[low]) * (offset - low),
     }
 
 
-def isolated_timings(model, samples, *, iterations):
-    """Reuse the same real cross KV and zero self KV for every product cache bucket."""
-    mel = model._mel_spectrogram(samples)
-    encoded = model.encode(mel)
-    # Encoder is enqueued normally by the product; decoder uses its captured CUDA graphs.
-    encoder = gpu_times(model._encoder, {"mel": mel}, iterations=iterations)
-    decoder = {}
-    c = model.config
-    dtype = np.dtype(PRECISIONS[model.precision].dtype)
-    for bucket in decoder_buckets():
-        owned = {}
+def _prefix_probe(model, encoded, bucket):
+    """Own one native chain prepared immediately before the requested history."""
+    from contextlib import contextmanager
+
+    from listenflow.fastest_whisper import _native
+
+    @contextmanager
+    def prepare():
+        if not 1 <= bucket <= model.config.text_positions:
+            raise ValueError("probe history exceeds checkpoint context")
+        chain = encoded.decoder(_native.GREEDY)
         try:
-            shape = (c.text_layers, 1, c.text_heads, bucket, c.audio_state // c.text_heads)
-            for name in ("self_keys", "self_values"):
-                size = int(np.prod(shape)) * np.dtype(dtype).itemsize
-                pointer = _cuda(cudart.cudaMalloc(size), "trial cache allocation")
-                owned[name] = _DeviceTensor(pointer, shape, dtype, 0)
-                _cuda(cudart.cudaMemset(pointer, 0, size), "trial cache zero")
-            mask = np.zeros((1, 1, 1, bucket + 1), dtype=np.float32)
-            mask.flat[0] = -np.inf
-            inputs = {
-                "tokens": np.array([[model.initial_tokens[0]]], dtype=np.int32),
-                "positions": np.array([[bucket - 1]], dtype=np.int32),
-                "mask": mask,
-                **owned,
-                "cross_keys": encoded.tensors["cross_keys"],
-                "cross_values": encoded.tensors["cross_values"],
-                "suppression": np.zeros((1, 1, c.vocab_size), dtype=np.float32),
-            }
-            decoder[str(bucket)] = gpu_times(model._decoder, inputs, iterations=iterations)
-            print(
-                f"decoder bucket {bucket}: {decoder[str(bucket)]['median_ms']:.3f} ms", flush=True
+            token = model.initial_tokens[0]
+            prefix = []
+            for position in range(bucket - 1):
+                prefix.append(token)
+                selected, _, _ = chain.greedy_step(
+                    token, position < len(model.initial_tokens), False
+                )
+                token = (
+                    model.initial_tokens[position + 1]
+                    if position + 1 < len(model.initial_tokens)
+                    else selected
+                )
+            prefix.append(token)
+            yield (
+                lambda: chain.greedy_step(token, bucket <= len(model.initial_tokens), False),
+                prefix,
             )
         finally:
-            _release_tensors(owned)
+            chain.close()
+
+    return prepare()
+
+
+def isolated_timings(model, samples, *, iterations):
+    """Visit every native bucket with real audio and prefix-computed KV."""
+    import statistics
+
+    from scripts.profile_latency import capture_native
+    from scripts.profile_layers import decoder_buckets
+
+    if iterations < 1:
+        raise ValueError("iterations must be positive")
+    buckets = decoder_buckets()
+    if any(bucket > model.config.text_positions for bucket in buckets):
+        raise ValueError("checkpoint context cannot reach every product cache bucket")
+    mel = model._mel_spectrogram(samples)
+    encoded = model.encode(mel)
+    encoder = gpu_times(lambda: model._native_model.encode(mel), iterations=iterations)
+    decoder = {}
+    for bucket in buckets:
+        times = []
+        for _ in range(iterations):
+            with _prefix_probe(model, encoded, bucket) as (call, prefix):
+                _, records = capture_native(call)
+                spans = [
+                    span for row in records for span in row["spans"] if span["phase"] == "enqueue"
+                ]
+                if len(spans) != 1 or spans[0]["bucket"] != bucket or spans[0]["gpu_ms"] is None:
+                    raise RuntimeError(f"native probe did not execute cache bucket {bucket}")
+                times.append(spans[0]["gpu_ms"])
+        ordered = sorted(times)
+        offset = (len(ordered) - 1) * 0.95
+        low = int(offset)
+        decoder[str(bucket)] = {
+            "samples_ms": times,
+            "median_ms": statistics.median(times),
+            "p95_ms": ordered[low]
+            + (ordered[min(low + 1, len(ordered) - 1)] - ordered[low]) * (offset - low),
+            "input_kind": "product_prefix",
+            "input_tokens": prefix,
+            "input_token": prefix[-1],
+            "history": bucket,
+            "bucket": bucket,
+            "precision": model.precision,
+        }
     return {"encoder": encoder, "decoder": decoder}
 
 
 def latency(model, manifest, output, *, per_band, iterations):
+    """Retain manifest selection and real product tokens while reading native timings."""
+    from scripts.profile_latency import DecoderProfiler, select_utterances, summarize
+
     selected = select_utterances(manifest, per_band=per_band)
-    # Preload waveforms so disk I/O cannot affect the three precision comparisons.
     waves = [_load_waveform(row) for row in selected]
-    for row in select_utterances(manifest, per_band=1):
-        model.transcribe(_load_waveform(row), beam_size=1, temperature=0, best_of=1)
-    _cuda(cudart.cudaDeviceSynchronize(), "trial warmup complete")
-    observations = [resource_sample(0)]
+    for wave in waves:
+        model.transcribe(wave, beam_size=1, temperature=0, best_of=1)
     records = []
-    with DecoderProfiler(model, cudart) as profiler:
-        for index, (row, samples) in enumerate(zip(selected, waves, strict=True), 1):
-            measured = profiler.measure(row, samples)
-            records.append(measured)
-            if index % 50 == 0:
-                observations.append(resource_sample(index))
-                print(f"latency {index}/{len(selected)}", flush=True)
+    with DecoderProfiler(model) as profiler:
+        for row, wave in zip(selected, waves, strict=True):
+            records.append(profiler.measure(row, wave))
     with (output / "utterances.jsonl").open("x") as stream:
-        for row in records:
-            stream.write(json.dumps(row) + "\n")
-    result = {"utterances": summarize(records), "ids": [row["id"] for row in selected]}
-    result["gpu_observations"] = observations
-    result["isolated"] = isolated_timings(model, waves[0], iterations=iterations)
-    return result
+        for record in records:
+            stream.write(json.dumps(record, allow_nan=False) + "\n")
+    return {
+        "utterances": summarize(records),
+        "ids": [row["id"] for row in selected],
+        "isolated": isolated_timings(model, waves[0], iterations=iterations),
+    }
 
 
 def evaluate(model, manifest, output):
@@ -226,26 +239,24 @@ def evaluate(model, manifest, output):
 
 
 def smoke(model, manifest, *, capture=False):
-    selected = select_utterances(manifest, per_band=1)
-    waves = [_load_waveform(row) for row in selected]
-    for wave in waves:
-        model.transcribe(wave, beam_size=1, temperature=0, best_of=1)
-    _cuda(cudart.cudaDeviceSynchronize(), "trial smoke warmup")
-    if capture:
-        _cuda(cudart.cudaProfilerStart(), "trial profiler start")
-    try:
-        results = []
-        for row, wave in zip(selected, waves, strict=True):
-            text = " ".join(
-                segment.text
-                for segment in model.transcribe(wave, beam_size=1, temperature=0, best_of=1)
-            )
-            results.append({"id": row["id"], "output": text, **word_errors(row["reference"], text)})
-            print(row["id"], repr(text), flush=True)
-        _cuda(cudart.cudaDeviceSynchronize(), "trial smoke complete")
-    finally:
-        if capture:
-            _cuda(cudart.cudaProfilerStop(), "trial profiler stop")
+    """Return real transcription and an optional native trace without external profilers."""
+    from scripts.profile_latency import DecoderProfiler, select_utterances
+
+    results = []
+    with DecoderProfiler(model) as profiler:
+        for row in select_utterances(manifest, per_band=1):
+            wave = _load_waveform(row)
+            model.transcribe(wave, beam_size=1, temperature=0, best_of=1)
+            observed = profiler.measure(row, wave)
+            result = {
+                "id": row["id"],
+                "output": observed["output"],
+                "tokens": observed["tokens"],
+                **word_errors(row["reference"], observed["output"]),
+            }
+            if capture:
+                result["native_operations"] = observed["native_operations"]
+            results.append(result)
     return {"utterances": results}
 
 

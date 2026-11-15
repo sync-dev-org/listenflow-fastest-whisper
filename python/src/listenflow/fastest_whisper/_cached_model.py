@@ -9,41 +9,15 @@ import numpy as np
 from listenflow import MetadataRecord
 
 from ._audio import N_SAMPLES
-from ._checkpoint import Checkpoint
 from ._decoding import DecodingSettings, decoding_settings
-from ._engines import _open_mel_engine, open_whisper_engine
 from ._inference import TensorRTWhisper
 from ._longform import SegmentTrace, TimedSegment, transcribe_mel, window_metadata
 
 
 class CachedWhisper(TensorRTWhisper):
-    def _open_sampled_engine(self, checkpoint: Checkpoint, *, batch_size: int):
-        return open_whisper_engine(
-            checkpoint,
-            decoder=True,
-            precision=self.precision,
-            logger=self.logger,
-            sample_batch=batch_size,
-        )
-
-    def _open_engine(self, checkpoint: Checkpoint, *, decoder: bool):
-        return open_whisper_engine(
-            checkpoint,
-            decoder=decoder,
-            precision=self.precision,
-            logger=self.logger,
-        )
-
     def warmup(self) -> None:
         mel = self._mel_spectrogram(np.zeros(16_000, dtype=np.float32))
         self.greedy_decode(self.encode(mel))
-
-    def _open_mel(self, checkpoint: Checkpoint):
-        return _open_mel_engine(
-            checkpoint,
-            precision=self.precision,
-            logger=self.logger,
-        )
 
     def transcribe(
         self,

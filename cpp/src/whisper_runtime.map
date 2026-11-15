@@ -1,0 +1,25 @@
+{
+    global:
+        lffw_get_version;
+        lffw_model_open;
+        lffw_model_get_info;
+        lffw_model_close;
+        lffw_model_destroy;
+        lffw_mel_compute;
+        lffw_mel_copy;
+        lffw_log_mel_block;
+        lffw_mel_destroy;
+        lffw_encode;
+        lffw_encode_features;
+        lffw_encoded_copy;
+        lffw_encoded_destroy;
+        lffw_decoder_create;
+        lffw_prefix_step;
+        lffw_greedy_step;
+        lffw_sampled_step;
+        lffw_prefix_destroy;
+        lffw_decoder_destroy;
+        lffw_error_message;
+        lffw_error_destroy;
+    local: *;
+};

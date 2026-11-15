@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import threading
 import weakref
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -51,30 +50,6 @@ class UnsupportedLanguageError(ConfigurationError):
     def __init__(self, language: str):
         self.language = language
         super().__init__(f"unsupported language: {language!r}; use a large-v3 language code")
-
-
-def _cuda_device_info(device: int) -> tuple[int, tuple[int, int] | None]:
-    """Return the visible device count and the selected device's compute capability."""
-    from cuda.bindings import runtime as cudart
-
-    status, count = cudart.cudaGetDeviceCount()
-    if status != cudart.cudaError_t.cudaSuccess:
-        raise RuntimeError(f"CUDA device enumeration failed: {status}")
-    if device >= count:
-        return count, None
-    attributes = cudart.cudaDeviceAttr
-    major_status, major = cudart.cudaDeviceGetAttribute(
-        attributes.cudaDevAttrComputeCapabilityMajor, device
-    )
-    minor_status, minor = cudart.cudaDeviceGetAttribute(
-        attributes.cudaDevAttrComputeCapabilityMinor, device
-    )
-    if (
-        major_status != cudart.cudaError_t.cudaSuccess
-        or minor_status != cudart.cudaError_t.cudaSuccess
-    ):
-        raise RuntimeError("CUDA compute capability lookup failed")
-    return count, (int(major), int(minor))
 
 
 def _check_cancelled(cancelled: threading.Event) -> None:
@@ -221,7 +196,8 @@ class FastestWhisperEngine(STTEngineBase):
 
     async def _load(self) -> None:
         try:
-            import tensoracle  # noqa: F401 -- validate native bindings before allocation
+            await self._release()
+            from . import _native  # noqa: F401 -- validate the actual model binding
         except Exception as error:
             raise EnvironmentUnavailableError(str(error)) from error
 
@@ -239,29 +215,12 @@ class FastestWhisperEngine(STTEngineBase):
             raise
 
     async def _release(self) -> None:
-        model, self._model = self._model, None
+        model = self._model
         if model is not None:
             await _run_native(lambda cancelled: model.close())
+            self._model = None
 
     def _load_and_warm(self, cancelled: threading.Event) -> None:
-        count, capability = _cuda_device_info(self.device)
-        if self.device >= count:
-            raise RuntimeError(
-                f"CUDA device {self.device} is unavailable; {count} visible device(s)"
-            )
-        if not any(capability in policy.capabilities for policy in PRECISIONS.values()):
-            raise RuntimeError(
-                f"CUDA device {self.device} compute capability {capability} is unsupported"
-            )
-        if capability not in PRECISIONS[self.precision].capabilities:
-            available = ", ".join(
-                name for name, policy in PRECISIONS.items() if capability in policy.capabilities
-            )
-            raise RuntimeError(
-                f"{self.precision} is unsupported on sm{capability[0]}{capability[1]}; "
-                f"select {available}"
-            )
-        importlib.import_module("tensorrt")
         _check_cancelled(cancelled)
         self._model = self._load_model()
         self._model._cancel_requested = cancelled

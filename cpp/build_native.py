@@ -1,11 +1,9 @@
-"""Build a development plugin against a verified SDK and the installed tensoracle."""
+"""Build development plugins against the revision-locked Conan SDKs."""
 
 import argparse
 import subprocess
-from importlib.metadata import distribution
 from pathlib import Path
 
-import tensoracle
 from tensoracle.bundle import inspect_bundle
 
 
@@ -13,16 +11,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle-dir", type=Path, required=True)
     parser.add_argument("--build-dir", type=Path, required=True)
-    parser.add_argument("--tensorrt-root", type=Path, required=True)
-    parser.add_argument(
-        "--cuda-root", type=Path, help="CUDA header root (default: PyPI nvidia/cu13)"
-    )
     args = parser.parse_args()
     bundle = args.bundle_dir.resolve()
     build = args.build_dir.resolve()
     inspect_bundle(bundle)
-    helper = Path(tensoracle.__file__).parent / "cpp"
-    cuda = args.cuda_root or Path(distribution("nvidia-cuda-runtime").locate_file("nvidia/cu13"))
     subprocess.run(
         [
             "cmake",
@@ -33,9 +25,6 @@ def main():
             "-G",
             "Ninja",
             "-DCMAKE_BUILD_TYPE=Release",
-            f"-DCUDAToolkit_ROOT={cuda.resolve()}",
-            f"-DTENSORACLE_CPP_ROOT={helper}",
-            f"-DTENSORRT_ROOT={args.tensorrt_root.resolve()}",
             f"-DLFFW_BUNDLE_ROOT={bundle}",
         ],
         check=True,

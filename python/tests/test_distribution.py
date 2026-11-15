@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tarfile
+import tomllib
 import unicodedata
 import zipfile
 from html.parser import HTMLParser
@@ -14,8 +15,8 @@ from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
 import pytest
-import tensoracle
 import yaml
+from packaging.requirements import Requirement
 
 from test_cubin_plugin import bundle, native_plugin  # noqa: F401 -- pytest fixtures
 
@@ -24,12 +25,50 @@ ROOT = PROJECT.parent
 PUBLIC_REPOSITORY = "https://github.com/sync-dev-org/listenflow-fastest-whisper"
 
 
+@pytest.mark.req("SP-LFFASTESTWHISPER-056")
+def test_runtime_dependencies_leave_tensorrt_to_the_host():
+    """Installing the package does not request a TensorRT wheel, directly or by extra."""
+    project = tomllib.loads((PROJECT / "pyproject.toml").read_text())
+    dependencies = list(map(Requirement, project["project"]["dependencies"]))
+    assert not any(requirement.name.startswith("tensorrt") for requirement in dependencies)
+    tensoracle = next(requirement for requirement in dependencies if requirement.name == "tensoracle")
+    assert not tensoracle.extras
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-037")
+def test_tensoracle_dependency_has_only_the_gpu_verified_minimum():
+    """The package accepts tensoracle 2.6.0 and later without an upper bound."""
+    project = tomllib.loads((PROJECT / "pyproject.toml").read_text())
+    dependencies = map(Requirement, project["project"]["dependencies"])
+    tensoracle = next(requirement for requirement in dependencies if requirement.name == "tensoracle")
+    assert str(tensoracle.specifier) == ">=2.6.0"
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-060")
+def test_development_installs_tensoracle_with_its_tensorrt_extra():
+    """The default development group installs the TensorRT Python binding through tensoracle."""
+    project = tomllib.loads((PROJECT / "pyproject.toml").read_text())
+    development = {
+        requirement.name: requirement
+        for requirement in map(Requirement, project["dependency-groups"]["dev"])
+    }
+    assert development["tensoracle"].extras == {"tensorrt"}
+    assert str(development["tensoracle"].specifier) == ">=2.6.0"
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-037")
+def test_development_lock_selects_the_gpu_verified_tensoracle():
+    """The reproducible development environment selects tensoracle 2.6.0."""
+    lock = tomllib.loads((PROJECT / "uv.lock").read_text())
+    assert next(package for package in lock["package"] if package["name"] == "tensoracle")[
+        "version"
+    ] == "2.6.0"
+
+
 @pytest.fixture(scope="module")
 def distributions(request):
     bundle_dir, _ = request.getfixturevalue("native_plugin")
     build_env = {
-        "TENSORRT_ROOT": os.environ["TENSORRT_ROOT"],
-        "TENSORACLE_CPP_ROOT": str(Path(tensoracle.__file__).parent / "cpp"),
         "LFFW_BUNDLE_ROOT": str(bundle_dir),
     }
     temporary_root = ROOT / ".nf" / "tmp"
@@ -106,9 +145,9 @@ def test_sdist_contains_only_package_sources_and_build_inputs(distributions):
     assert PurePosixPath("cpp/fc1_registration.cpp") in paths
 
 
-@pytest.mark.req("SP-LFFASTESTWHISPER-007")
+@pytest.mark.req("SP-LFFASTESTWHISPER-023")
 def test_wheel_contains_only_the_package_and_distribution_metadata(distributions):
-    """The wheel installs the namespace package, its native fc1 library, and metadata."""
+    """The wheel installs only the Python package, three native libraries and metadata."""
     paths = _distribution_files(distributions)["wheel"]
     top_levels = {path.parts[0] for path in paths}
     assert "listenflow" in top_levels
@@ -120,16 +159,60 @@ def test_wheel_contains_only_the_package_and_distribution_metadata(distributions
         paths[PurePosixPath("listenflow/fastest_whisper/assets/fp8-scales.json")]
         == (PROJECT / "src/listenflow/fastest_whisper/assets/fp8-scales.json").read_bytes()
     )
-    library = PurePosixPath("listenflow/fastest_whisper/liblffw_fc1_plugin.so")
-    assert paths[library].startswith(b"\x7fELF")
-    assert [path for path in paths if path.suffix == ".so"] == [library]
+    package = PurePosixPath("listenflow/fastest_whisper")
+    native = {
+        package / name
+        for name in (
+            "_native.abi3.so",
+            "liblffw_runtime.so",
+            "liblffw_fc1_plugin.so",
+        )
+    }
+    assert {path for path, data in paths.items() if data.startswith(b"\x7fELF")} == native
+    assert {path for path in paths if ".so" in path.name} == native
+    assert not [path for path in paths if path.suffix in {".h", ".hpp", ".cmake", ".a"}]
+
     wheel_metadata = next(
         data for path, data in paths.items() if str(path).endswith(".dist-info/WHEEL")
     )
     assert b"Root-Is-Purelib: false" in wheel_metadata
-    assert b"Tag: py3-none-" in wheel_metadata
+    assert b"Tag: cp312-abi3-" in wheel_metadata
 
 
+@pytest.mark.req("SP-LFFASTESTWHISPER-054")
+@pytest.mark.req("SP-LFFASTESTWHISPER-055")
+@pytest.mark.req("SP-LFFASTESTWHISPER-056")
+@pytest.mark.req("SP-LFFASTESTWHISPER-061")
+def test_wheel_native_libraries_use_relative_dependency_paths(distributions, tmp_path):
+    """The wheel reads tensoracle from its sibling wheel and TensorRT from the host loader."""
+    paths = _distribution_files(distributions)["wheel"]
+    for path, data in paths.items():
+        if not data.startswith(b"\x7fELF"):
+            continue
+        library = tmp_path / path.name
+        library.write_bytes(data)
+        result = subprocess.run(
+            ["readelf", "--dynamic", str(library)],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "LC_ALL": "C"},
+        ).stdout
+        needed = re.findall(r"\(NEEDED\).*?\[([^]]+)\]", result)
+        assert not any(name.startswith("libcudart.so") for name in needed)
+        runpaths = re.findall(r"\((?:RPATH|RUNPATH)\).*?\[([^]]+)\]", result)
+        entries = [entry for group in runpaths for entry in group.split(":")]
+        assert all(entry.startswith("$ORIGIN") for entry in entries), result
+        assert not any("tensorrt" in entry.lower() for entry in entries), result
+        if path.name == "liblffw_runtime.so":
+            assert "libtensoracle.so.2" in needed, result
+            assert "$ORIGIN/../../tensoracle/cpp/lib" in entries, result
+        elif path.name == "liblffw_fc1_plugin.so":
+            assert "libtensoracle.so.2" not in needed, result
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-037")
+@pytest.mark.req("SP-LFFASTESTWHISPER-056")
 def test_wheel_metadata_describes_the_public_package(distributions):
     """PyPI receives the README, author, MIT license, supported Python versions, and public URL."""
     files = _distribution_files(distributions)["wheel"]
@@ -149,6 +232,10 @@ def test_wheel_metadata_describes_the_public_package(distributions):
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
     } <= set(metadata.get_all("Classifier", []))
+    project = tomllib.loads((PROJECT / "pyproject.toml").read_text())
+    assert {str(Requirement(value)) for value in metadata.get_all("Requires-Dist", [])} == {
+        str(Requirement(value)) for value in project["project"]["dependencies"]
+    }
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-007")
@@ -224,7 +311,15 @@ def test_release_version_requires_an_exact_tag_and_survives_source_archiving(tmp
             with tarfile.open(next(output.glob("*.tar.gz"))) as archive:
                 archive.extractall(unpacked, filter="data")
             built = subprocess.run(
-                ["uv", "build", "--wheel", "-Cwheel.cmake=false", "--out-dir", str(output)],
+                [
+                    "uv",
+                    "build",
+                    "--wheel",
+                    "-Cwheel.cmake=false",
+                    "-Cwheel.py-api=py3",
+                    "--out-dir",
+                    str(output),
+                ],
                 cwd=next(unpacked.iterdir()),
                 capture_output=True,
                 text=True,

@@ -6,7 +6,6 @@ import hashlib
 import json
 import mmap
 import os
-import re
 import subprocess
 import sys
 import wave
@@ -103,10 +102,6 @@ def _events(engine_loop, engine, pcm):
     return engine_loop.run(collect())
 
 
-def _engine_files(cache):
-    return sorted((cache / "tensoracle").glob("*.engine"))
-
-
 def _engine_identity(path):
     with path.open("rb") as stream:
         return path.stat().st_ino, hashlib.file_digest(stream, "sha256").hexdigest()
@@ -114,7 +109,8 @@ def _engine_identity(path):
 
 def _damage_saved_plugin(path, damage):
     """Keep the envelope valid while making a serialized creator unavailable."""
-    magic = b"TENSORACLE\x01"
+    # v2.1.2 writes ten magic bytes, followed by an eight-byte big-endian length.
+    magic = b"TENSORACLE"
     name = b"LffwFp16Fc1"
     namespace = b"listenflow.fastest_whisper"
     with path.open("r+b") as stream:
@@ -477,12 +473,12 @@ async def run():
             pcm = source.readframes(source.getnframes())
         async def chunks():
             yield pcm
-        print(json.dumps([event.text async for event in engine.stream(chunks())
-                          if isinstance(event, Final)]))
+        texts = [event.text async for event in engine.stream(chunks()) if isinstance(event, Final)]
+        print(json.dumps({'texts': texts, 'paths': engine._model._native_model.info['engine_paths']}))
 asyncio.run(run())
 """
 
-    def recognize(precision, unavailable=None):
+    def recognize(precision):
         result = subprocess.run(
             [
                 sys.executable,
@@ -498,17 +494,9 @@ asyncio.run(run())
             check=False,
         )
         assert result.returncode == 0, result.stdout + result.stderr
-        if unavailable is not None:
-            diagnostics = result.stdout + result.stderr
-            assert "IPluginRegistry" in diagnostics, diagnostics
-            if unavailable == "missing-plugin":
-                assert "LffwNoneFc1" in diagnostics, diagnostics
-            else:
-                assert "LffwFp16Fc1" in diagnostics, diagnostics
-                assert re.search(r"\bversion\b[\s:=\"']*9\b", diagnostics), diagnostics
-        text = json.loads(result.stdout.splitlines()[-1])
-        assert text and all(text)
-        return text
+        observed = json.loads(result.stdout.splitlines()[-1])
+        assert observed["texts"] and all(observed["texts"])
+        return observed
 
     identities = []
     for precision in ("fp32", "fp16"):
@@ -517,8 +505,9 @@ asyncio.run(run())
             cache = Path(directory)
             monkeypatch.setenv("XDG_CACHE_HOME", directory)
             expected = recognize(precision)
-            files = _engine_files(cache)
+            files = [Path(path) for path in expected["paths"].values()]
             assert len(files) == 3
+            assert all(path.is_relative_to(cache / "tensoracle") for path in files)
             identities.append({path.name for path in files})
             before = {path.name: _engine_identity(path) for path in files}
             assert recognize(precision) == expected
@@ -533,7 +522,7 @@ asyncio.run(run())
                         target.write_bytes(b"truncated")
                     elif damage == "incompatible":
                         with target.open("r+b") as stream:
-                            stream.read(len(b"TENSORACLE\x01"))
+                            stream.read(len(b"TENSORACLE"))
                             size = int.from_bytes(stream.read(8), "big")
                             header = json.loads(stream.read(size))
                             version = header["conditions"]["graph_version"]
@@ -542,13 +531,12 @@ asyncio.run(run())
                                 header, sort_keys=True, separators=(",", ":")
                             ).encode()
                             assert len(encoded) == size
-                            stream.seek(len(b"TENSORACLE\x01") + 8)
+                            stream.seek(len(b"TENSORACLE") + 8)
                             stream.write(encoded)
                     elif not _damage_saved_plugin(target, damage):
                         continue
                     damaged_inode, damaged_hash = _engine_identity(target)
-                    unavailable = damage if damage in ("missing-plugin", "plugin-version") else None
-                    assert recognize(precision, unavailable) == expected
+                    assert recognize(precision) == expected
                     rebuilt_inode, rebuilt_hash = _engine_identity(target)
                     assert rebuilt_inode != damaged_inode, (precision, damage, target.name)
                     assert rebuilt_hash != damaged_hash, (precision, damage, target.name)

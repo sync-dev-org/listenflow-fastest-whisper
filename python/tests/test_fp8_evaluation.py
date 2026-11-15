@@ -5,6 +5,31 @@ import pytest
 
 from listenflow.fastest_whisper._decoding import DecodingSettings, search_candidates
 
+pytest_plugins = ("test_latency_profile",)
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-001")
+def test_native_isolated_probe_visits_every_product_bucket(fault_observer, tmp_path_factory):
+    """Every declared bucket is measured with completed audio and prefix KV."""
+    from diagnostic_runtime_fixture import DiagnosticRuntime
+    from native_runtime_fixture import prepare_source_checkpoint
+
+    runtime = DiagnosticRuntime(
+        fault_observer, prepare_source_checkpoint(tmp_path_factory, text_positions=448)
+    )
+    runtime.run("""
+from scripts.fp8_trial import isolated_timings
+from scripts.profile_layers import decoder_buckets
+report = isolated_timings(model, waveform, iterations=1)
+assert list(map(int, report['decoder'])) == list(decoder_buckets())
+for key, result in report['decoder'].items():
+    assert result['input_kind'] == 'product_prefix'
+    assert result['history'] == result['bucket'] == int(key)
+    assert result['precision'] == 'fp32'
+    assert len(result['input_tokens']) == int(key)
+    assert len(result['samples_ms']) == 1 and result['samples_ms'][0] > 0
+""")
+
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-003")
 def test_fp32_evaluation_record_does_not_claim_fp8_calibration_or_graph():

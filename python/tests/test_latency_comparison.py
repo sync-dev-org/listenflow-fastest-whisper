@@ -19,6 +19,7 @@ from scripts.benchmark_latency import (
 from scripts.evaluate_wer import word_errors, write_csv
 from whisper.normalizers import EnglishTextNormalizer
 
+from gpu_query_fixture import gpu_queries
 from listenflow.fastest_whisper._decoding import DecodingSettings
 from listenflow.fastest_whisper._inference import Transcription
 
@@ -171,20 +172,116 @@ def test_latency_runner_includes_the_models_gpu_features_in_the_timed_transcript
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-005")
-def test_gpu_observation_rejects_another_compute_process(monkeypatch):
+def test_gpu_observation_rejects_another_compute_process():
     """The comparison records its own process and rejects a competing GPU process."""
-    pids = [str(os.getpid())]
+    with gpu_queries() as state:
+        observed = benchmark_latency._gpu_sample(100)
+        assert observed["compute_process_pids"] == [os.getpid()]
+        assert observed["name"] == "CPU test GPU"
+        assert observed["driver_version"] == "600.00"
+        assert [observed[key] for key in ("clocks.sm", "utilization.gpu", "memory.used")] == [
+            "2500",
+            "50",
+            "4000",
+        ]
+        state.competing_at = state.completed
+        with pytest.raises(RuntimeError, match="other GPU compute processes"):
+            benchmark_latency._gpu_sample(200)
 
-    def query(args, **_kwargs):
-        if "--query-compute-apps=pid" in args:
-            return "\n".join(pids) + "\n"
-        return "2500, 50, 4000\n"
 
-    monkeypatch.setattr(benchmark_latency.subprocess, "check_output", query)
-    assert benchmark_latency._gpu_sample(100)["compute_process_pids"] == [os.getpid()]
-    pids.append(str(os.getpid() + 1))
+@pytest.mark.req("SP-LFFASTESTWHISPER-005")
+def test_short_gpu_observations_launch_once_each_and_wait_a_minute_between_processes():
+    """Consecutive snapshots wait outside transcription and each use one GPU command."""
+    with gpu_queries() as state:
+        benchmark_latency._gpu_sample(0)
+        state.seconds += 7
+        benchmark_latency._gpu_sample(1)
+        state.seconds += 65
+        benchmark_latency._gpu_sample(2)
+        assert len(state.calls) == 3
+        assert all(args == ["nvidia-smi", "-q", "-x"] for args, _, _ in state.calls)
+        times = [seconds for _, _, seconds in state.calls]
+        assert times[1] - times[0] >= 60
+        assert times[2] - times[1] == 65
+        assert any(seconds == 53 for _, seconds in state.sleeps)
+
+
+@pytest.fixture
+def comparison_run(tmp_path, monkeypatch, source_checkpoint):
+    """Keep the runner and audio real, replacing only GPU execution and queries."""
+    import faster_whisper
+    from cuda.bindings import runtime as cu
+
+    data = tmp_path / "data"
+    ids = _fleurs_shard(data, "en", ["HELLO"] * 101)
+    converted = tmp_path / "converted"
+    converted.mkdir()
+    (converted / "conversion.json").write_text(
+        json.dumps(
+            {
+                "checkpoint_sha256": benchmark_latency.checkpoint_hashes(source_checkpoint),
+                "quantization": "float16",
+            }
+        )
+    )
+
+    class Model:
+        def __init__(self, *_args, **_kwargs):
+            self.model = SimpleNamespace(device="cuda", compute_type="float16")
+
+        def transcribe(self, samples, **_options):
+            assert samples.shape == (160,) and samples.dtype == np.float32
+            state.completed += 1
+            return iter([SimpleNamespace(text="HELLO")]), None
+
+    monkeypatch.setattr(faster_whisper, "WhisperModel", Model)
+    monkeypatch.setattr(cu, "cudaDeviceSynchronize", lambda: (cu.cudaError_t.cudaSuccess,))
+    output = tmp_path / "output"
+
+    def run():
+        benchmark_latency.run(
+            "faster-whisper",
+            source_checkpoint,
+            None,
+            output,
+            converted,
+            data_dir=data,
+            limit=len(ids),
+        )
+
+    with gpu_queries() as state:
+        yield run, state, output, ids
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-005")
+def test_comparison_queries_gpu_only_before_and_after_all_utterances(comparison_run):
+    """GPU queries bracket the entire run and the report retains all measured utterances."""
+    run, state, output, ids = comparison_run
+
+    run()
+
+    assert [count for _, count, _ in state.calls] == [0, 102]
+    assert state.calls[1][2] - state.calls[0][2] >= 60
+    assert all(count in (0, 102) for count, _seconds in state.sleeps)
+    metadata = json.loads((output / "faster-whisper.json").read_text())
+    assert [row["completed_utterances"] for row in metadata["gpu_observations"]] == [0, 101]
+    assert metadata["gpu"] == "CPU test GPU" and metadata["driver"] == "600.00"
+    assert [row["id"] for row in benchmark_latency.read_csv(output / "faster-whisper.csv")] == ids
+    assert not (output / "faster-whisper.csv.partial").exists()
+
+
+@pytest.mark.req("SP-LFFASTESTWHISPER-005")
+@pytest.mark.parametrize("competing_at", [0, 102], ids=["before-load", "after-run"])
+def test_comparison_rejects_competing_gpu_processes_at_run_boundaries(comparison_run, competing_at):
+    """A competing process before loading or after the run rejects the result."""
+    run, state, output, _ids = comparison_run
+    state.competing_at = competing_at
+
     with pytest.raises(RuntimeError, match="other GPU compute processes"):
-        benchmark_latency._gpu_sample(200)
+        run()
+
+    assert state.completed == competing_at
+    assert not (output / "faster-whisper.json").exists()
 
 
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
@@ -415,9 +512,11 @@ def test_selected_language_reaches_both_greedy_decoders(tmp_path, language):
     model.begin_suppressed = set()
     model._prefix_states = {}
     model._root_prefix = ()
-    model._mel = NativeSession("mel")
-    model._encoder = NativeSession("encoder")
-    model._decoder = NativeSession("decoder")
+    from native_boundary import initialize_state
+
+    initialize_state(
+        model, NativeSession("mel"), NativeSession("encoder"), NativeSession("decoder")
+    )
     try:
         assert (
             _transcribe_tensor_rt(model, np.zeros(160, dtype=np.float32), language=language)

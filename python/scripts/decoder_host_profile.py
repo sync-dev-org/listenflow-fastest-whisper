@@ -14,7 +14,7 @@ import multiprocessing
 import statistics
 import time
 from collections import defaultdict
-from contextlib import ExitStack
+from itertools import pairwise
 from pathlib import Path
 
 SECTIONS = (
@@ -58,6 +58,17 @@ STEP_FIELDS = (
     "wait_cpu_ns",
     "wait_wall_ns",
     "run_return_ns",
+    "copy_cpu_ns",
+    "copy_wall_ns",
+    "sync_cpu_ns",
+    "sync_wall_ns",
+    "query_count",
+    "sleep_ns",
+    "sleeps",
+    "endpoint_method",
+    "input_kind",
+    "history",
+    "precision",
 )
 
 
@@ -271,430 +282,170 @@ class CpuLoad:
                 worker.join(timeout=5)
 
 
-class StepProfiler:
-    """Wrap product functions, retaining exclusive host intervals and CUDA events.
-
-    Between decoder calls, Python token handling belongs to the following step's
-    section 1. Final output assembly belongs to the last step's section 7. Sections
-    2/3/4/5/6 time the corresponding function/API calls; remaining buffer and shape
-    handling belongs to section 1 before enqueue and section 7 after enqueue.
-    Event record overhead belongs to those Python sections and is also reported.
-    """
-
-    def __init__(self, model, cudart, *, clock=time.perf_counter_ns, detailed=False):
-        self.model, self.cu, self.clock = model, cudart, clock
-        self.detailed = detailed
-        self.stack = ExitStack()
-        self.events = []
-        self.active = False
-        self.current = None
-
-    def cuda(self, result):
-        if result[0] != self.cu.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"CUDA operation failed: {result[0]}")
-        return result[1] if len(result) > 1 else None
-
-    def event(self):
-        event = self.cuda(self.cu.cudaEventCreate())
-        self.events.append(event)
-        return event
-
-    def __enter__(self):
-        from unittest.mock import patch
-
-        from listenflow.fastest_whisper._inference import _HostIO
-
-        self.io = self.model._decoder
-        try:
-            self.origin = self.event()
-            self.check_event = self.event()
-            self.pairs = [
-                (self.event(), self.event()) for _ in range(self.model.config.text_positions + 8)
-            ]
-            if self.detailed:
-                self.copy_pairs = [(self.event(), self.event()) for _ in self.pairs]
-            original_run = _HostIO.run
-            original_pad, original_compact = _HostIO._pad_cache, _HostIO._compact_cache
-            original_enqueue = _HostIO._enqueue
-            original_copy, original_sync = self.cu.cudaMemcpyAsync, self.cu.cudaStreamSynchronize
-
-            def region(section, function, *args, **kwargs):
-                ledger = self.current
-                if ledger is None:
-                    return function(*args, **kwargs)
-                previous = ledger.section
-                ledger.switch(section, self.clock())
-                cpu_before = (
-                    time.thread_time_ns() if self.detailed and section == "d2h_sync" else None
-                )
-                try:
-                    return function(*args, **kwargs)
-                finally:
-                    if cpu_before is not None:
-                        self.wait_cpu += time.thread_time_ns() - cpu_before
-                    ledger.switch(previous, self.clock())
-
-            def run(io, inputs, **kwargs):
-                if not self.active or io is not self.io:
-                    return original_run(io, inputs, **kwargs)
-                ledger = self.current = Phases(self.next_start)
-                index = len(self.records)
-                if index >= len(self.pairs):
-                    raise RuntimeError("decoder event pool exhausted")
-                self.event_overhead = 0
-                self.wait_cpu = self.copy_bytes = 0
-                self.copy_started = False
-                self.bucket = None
-                try:
-                    outputs = original_run(io, inputs, **kwargs)
-                    ended = self.clock()
-                finally:
-                    self.current = None
-                row = ledger.finish(ended)
-                token_array = outputs.get("token")
-                if not hasattr(token_array, "reshape"):
-                    token_array = outputs.get("greedy")
-                row.update(
-                    bucket=self.bucket,
-                    input_token=int(inputs["tokens"].reshape(-1)[0]),
-                    output_token=int(token_array.reshape(-1)[0]),
-                    step=index,
-                    event_record_ns=self.event_overhead,
-                )
-                if self.detailed:
-                    row.update(
-                        copy_bytes=self.copy_bytes,
-                        wait_cpu_ns=self.wait_cpu,
-                        wait_wall_ns=sum(stop - start for start, stop in ledger.wait_spans),
-                        run_return_ns=ended,
-                    )
-                self.records.append((row, ledger))
-                self.next_start = ended
-                return outputs
-
-            def pad(io, *args, **kwargs):
-                return region("pad_cache", original_pad, io, *args, **kwargs)
-
-            def compact(io, *args, **kwargs):
-                return region("compact_cache", original_compact, io, *args, **kwargs)
-
-            def copy(*args):
-                kind = args[3]
-                section = (
-                    "h2d" if kind == self.cu.cudaMemcpyKind.cudaMemcpyHostToDevice else "d2h_sync"
-                )
-                if self.detailed and self.current is not None and section == "d2h_sync":
-                    self.copy_bytes += args[2]
-                    if not self.copy_started:
-                        self.record_copy_event(0, args[4])
-                        self.copy_started = True
-                return region(section, original_copy, *args)
-
-            def synchronize(stream):
-                if self.detailed and self.current is not None and self.copy_started:
-                    self.record_copy_event(1, stream)
-                return region("d2h_sync", original_sync, stream)
-
-            if hasattr(_HostIO, "_wait"):
-                original_wait = _HostIO._wait
-
-                def wait(io):
-                    if self.detailed and self.current is not None and self.copy_started:
-                        self.record_copy_event(1, io.stream)
-                    return region("d2h_sync", original_wait, io)
-
-                self.stack.enter_context(patch.object(_HostIO, "_wait", wait))
-
-            def enqueue(io, addresses, *, stream):
-                if self.current is None or io is not self.io:
-                    return original_enqueue(io, addresses, stream=stream)
-                shapes = tuple(
-                    (name, io.execution.get_tensor_shape(name)) for name in io.execution._ranges
-                )
-                entry = io._graphs.entries.get(shapes)
-                if entry is None or entry[2] != tuple(addresses.items()):
-                    raise RuntimeError("decoder graph must be warm before measurement")
-                self.bucket = io.execution.get_tensor_shape("self_keys")[-2]
-                start, end = self.pairs[len(self.records)]
-                before = self.clock()
-                self.cuda(self.cu.cudaEventRecord(start, stream))
-                after = self.clock()
-                self.event_overhead += after - before
-                self.current.switch("graph_launch", after)
-                result = original_enqueue(io, addresses, stream=stream)
-                self.current.switch("python_after", self.clock())
-                before = self.clock()
-                self.cuda(self.cu.cudaEventRecord(end, stream))
-                self.event_overhead += self.clock() - before
-                return result
-
-            for owner, name, replacement in (
-                (_HostIO, "run", run),
-                (_HostIO, "_pad_cache", pad),
-                (_HostIO, "_compact_cache", compact),
-                (_HostIO, "_enqueue", enqueue),
-                (self.cu, "cudaMemcpyAsync", copy),
-                (self.cu, "cudaStreamSynchronize", synchronize),
-            ):
-                self.stack.enter_context(patch.object(owner, name, replacement))
-        except BaseException:
-            self.__exit__(None, None, None)
-            raise
-        return self
-
-    def record_copy_event(self, index, stream):
-        before = self.clock()
-        self.cuda(self.cu.cudaEventRecord(self.copy_pairs[len(self.records)][index], stream))
-        self.event_overhead += self.clock() - before
-
-    def calibrate(self):
-        self.cuda(self.cu.cudaStreamSynchronize(self.io.stream))
-        lower = self.clock()
-        self.cuda(self.cu.cudaEventRecord(self.origin, self.io.stream))
-        self.cuda(self.cu.cudaEventSynchronize(self.origin))
-        upper = self.clock()
-        self.anchor = {"lower_ns": lower, "upper_ns": upper}
-
-    def check_clock(self):
-        lower = self.clock()
-        self.cuda(self.cu.cudaEventRecord(self.check_event, self.io.stream))
-        self.cuda(self.cu.cudaEventSynchronize(self.check_event))
-        upper = self.clock()
-        offset = round(
-            float(self.cuda(self.cu.cudaEventElapsedTime(self.origin, self.check_event))) * 1e6
-        )
-        first = self.anchor
-        uncertainty = (first["upper_ns"] - first["lower_ns"] + upper - lower + 1) // 2
-        uncertainty += math.ceil(abs(offset) * 2**-23) + 1_000
-        drift = (lower + upper - first["lower_ns"] - first["upper_ns"]) // 2 - offset
-        return {
-            "first": first,
-            "last": {"lower_ns": lower, "upper_ns": upper},
-            "drift_ns": drift,
-            "uncertainty_ns": uncertainty,
-            "within_uncertainty": abs(drift) <= uncertainty,
+def _native_steps(records, started, ended, *, events, detailed):
+    """Partition host timestamps using the innermost recorded native operation."""
+    operations = [
+        row
+        for row in records
+        if row["name"] in ("lffw_greedy_step", "lffw_prefix_step", "lffw_sampled_step")
+    ]
+    if not operations:
+        raise RuntimeError("measurement executed no native decoder steps")
+    result = []
+    previous = started
+    categories = {
+        "cache_prepare": "pad_cache",
+        "zero": "pad_cache",
+        "h2d": "h2d",
+        "enqueue": "graph_launch",
+        "cache_append": "compact_cache",
+        "d2d": "compact_cache",
+        "d2h": "d2h_sync",
+        "wait": "d2h_sync",
+    }
+    for index, operation in enumerate(operations):
+        stop = ended if index == len(operations) - 1 else operation["end_ns"]
+        spans = operation["spans"]
+        enqueues = [span for span in spans if span["phase"] == "enqueue"]
+        bucket = next((span["bucket"] for span in enqueues), 0)
+        row = {
+            "start_ns": previous,
+            "end_ns": stop,
+            "total_ns": stop - previous,
+            "step": index,
+            "bucket": bucket,
+            "input_token": operation["input_token"],
+            "output_token": operation["output_token"],
         }
-
-    def capture(self, function, *, recalibrate=True):
-        self.records = []
-        if recalibrate:
-            self.calibrate()
-        lower, upper = self.anchor["lower_ns"], self.anchor["upper_ns"]
-        self.next_start = self.clock()
-        self.active = True
-        try:
-            result = function()
-            ended = self.clock()
-        finally:
-            self.active = False
-        if not self.records:
-            raise RuntimeError("measurement executed no decoder steps")
-        row, ledger = self.records[-1]
-        ledger.switch("python_after", row["end_ns"])
-        row.update(ledger.finish(ended))
-        midpoint, uncertainty = (lower + upper) // 2, (upper - lower + 1) // 2
-        for index, (row, ledger) in enumerate(self.records):
-            start, end = self.pairs[index]
-            graph_gpu = round(float(self.cuda(self.cu.cudaEventElapsedTime(start, end))) * 1e6)
-            offset = round(float(self.cuda(self.cu.cudaEventElapsedTime(self.origin, end))) * 1e6)
-            # CUDA event elapsed time is a float in milliseconds. Include its
-            # floating-point representation error for a long utterance anchor.
-            error = uncertainty + math.ceil(abs(offset) * 2**-23) + 1_000
-            graph_end = midpoint + offset
+        points = sorted(
+            {
+                previous,
+                stop,
+                *(
+                    max(previous, min(stop, span[key]))
+                    for span in spans
+                    for key in ("start_ns", "end_ns")
+                ),
+            }
+        )
+        totals = dict.fromkeys(SECTIONS, 0)
+        first_enqueue = min((span["start_ns"] for span in enqueues), default=stop)
+        for lower, upper in pairwise(points):
+            covering = [
+                span for span in spans if span["start_ns"] <= lower and span["end_ns"] >= upper
+            ]
+            if covering:
+                inner = min(covering, key=lambda span: span["end_ns"] - span["start_ns"])
+                category = categories.get(
+                    inner["phase"], "python_after" if lower >= first_enqueue else "python_before"
+                )
+            else:
+                category = "python_after" if lower >= first_enqueue else "python_before"
+            totals[category] += upper - lower
+        row.update({f"{name}_ns": value for name, value in totals.items()})
+        copies = [span for span in spans if span["phase"] == "d2h"]
+        waits = [span for span in spans if span["phase"] == "wait"]
+        row.update(
+            copy_cpu_ns=sum(span["cpu_ns"] for span in copies),
+            copy_wall_ns=sum(span["end_ns"] - span["start_ns"] for span in copies),
+            sync_cpu_ns=sum(span["cpu_ns"] for span in waits),
+            sync_wall_ns=sum(span["end_ns"] - span["start_ns"] for span in waits),
+            query_count=sum(span["query_count"] for span in waits),
+            sleeps=operation["sleeps"],
+            sleep_ns=json.dumps(
+                [sleep["end_ns"] - sleep["start_ns"] for sleep in operation["sleeps"]]
+            ),
+        )
+        row["wait_cpu_ns"] = row["copy_cpu_ns"] + row["sync_cpu_ns"]
+        row["wait_wall_ns"] = row["copy_wall_ns"] + row["sync_wall_ns"]
+        if events:
+            if any(span["graph_capture"] for span in spans):
+                raise RuntimeError("decoder graph must be warm before measurement")
+            if not enqueues or any(span["gpu_ms"] is None for span in enqueues):
+                raise RuntimeError("native GPU timing events are unavailable")
+            row["graph_gpu_ns"] = round(sum(span["gpu_ms"] for span in enqueues) * 1e6)
+            lower = min(span["start_ns"] for span in enqueues)
+            upper = max((span["end_ns"] for span in waits), default=operation["end_ns"])
+            midpoint, uncertainty = (lower + upper) // 2, (upper - lower + 1) // 2
             row.update(
-                graph_gpu_ns=graph_gpu,
-                graph_end_ns=graph_end,
-                graph_end_lower_ns=graph_end - error,
-                graph_end_upper_ns=graph_end + error,
-                **split_wait(ledger.wait_spans, graph_end, error),
-                partition_error=partition_error(row),
+                graph_end_ns=midpoint,
+                graph_end_lower_ns=lower,
+                graph_end_upper_ns=upper,
+                endpoint_method="host bounds; no event synchronization calibration",
             )
-            if self.detailed:
-                copy_start, copy_end = self.copy_pairs[index]
-                offsets = [
-                    round(float(self.cuda(self.cu.cudaEventElapsedTime(self.origin, event))) * 1e6)
-                    for event in (copy_start, copy_end)
-                ]
+            row.update(
+                split_wait(
+                    [(span["start_ns"], span["end_ns"]) for span in waits], midpoint, uncertainty
+                )
+            )
+            if detailed:
                 row.update(
-                    copy_event_window_ns=round(
-                        float(self.cuda(self.cu.cudaEventElapsedTime(copy_start, copy_end))) * 1e6
-                    ),
+                    copy_bytes=sum(span["bytes"] for span in copies),
+                    copy_event_window_ns=round(sum(span["gpu_ms"] or 0 for span in copies) * 1e6),
+                    run_return_ns=operation["end_ns"],
                     **split_tail(
-                        graph_end,
-                        midpoint + offsets[0],
-                        midpoint + offsets[1],
-                        row["run_return_ns"],
+                        midpoint,
+                        min((span["start_ns"] for span in copies), default=stop),
+                        max((span["end_ns"] for span in copies), default=stop),
+                        operation["end_ns"],
                     ),
                 )
-        return result, [row for row, _ in self.records]
-
-    def __exit__(self, *_exc):
-        self.active = False
-        self.current = None
-        self.stack.close()
-        try:
-            if self.events:
-                self.cuda(self.cu.cudaDeviceSynchronize())
-        finally:
-            for event in reversed(self.events):
-                self.cuda(self.cu.cudaEventDestroy(event))
-            self.events.clear()
+        row["partition_error"] = partition_error(row)
+        result.append(row)
+        previous = stop
+    return result
 
 
 class WallProfiler:
-    """Measure the same decoder step intervals without sections or CUDA events."""
+    """Read real native token calls without adding timing events."""
+
+    flags = 1
 
     def __init__(self, model, *, clock=time.perf_counter_ns):
         self.model, self.clock = model, clock
-        self.active = False
+        self.session = None
+        self.detailed = False
 
     def __enter__(self):
-        from unittest.mock import patch
+        from scripts.profile_latency import diagnostic_session
 
-        from listenflow.fastest_whisper._inference import _HostIO
-
-        original = _HostIO.run
-
-        def run(io, inputs, **kwargs):
-            if not self.active or io is not self.model._decoder:
-                return original(io, inputs, **kwargs)
-            outputs = original(io, inputs, **kwargs)
-            ended = self.clock()
-            token = outputs.get("token")
-            if not hasattr(token, "reshape"):
-                token = outputs.get("greedy")
-            self.rows.append(
-                {
-                    "start_ns": self.next_start,
-                    "end_ns": ended,
-                    "total_ns": ended - self.next_start,
-                    "bucket": io.execution.get_tensor_shape("self_keys")[-2],
-                    "step": len(self.rows),
-                    "input_token": int(inputs["tokens"].reshape(-1)[0]),
-                    "output_token": int(token.reshape(-1)[0]),
-                }
-            )
-            self.next_start = ended
-            return outputs
-
-        self.patch = patch.object(_HostIO, "run", run)
-        self.patch.__enter__()
+        self.session = diagnostic_session(self.flags)
         return self
 
     def capture(self, function, **_kwargs):
-        self.rows = []
-        self.next_start = self.clock()
-        self.active = True
-        try:
+        started = self.clock()
+        with self.session:
             result = function()
             ended = self.clock()
-        finally:
-            self.active = False
-        if not self.rows:
-            raise RuntimeError("measurement executed no decoder steps")
-        row = self.rows[-1]
-        row["total_ns"] += ended - row["end_ns"]
-        row["end_ns"] = ended
-        return result, self.rows
+        rows = _native_steps(
+            self.session.records,
+            started,
+            ended,
+            events=bool(self.flags & 2),
+            detailed=self.detailed,
+        )
+        return result, rows
 
     def __exit__(self, *_exc):
-        self.active = False
-        self.patch.__exit__(None, None, None)
+        if self.session is not None:
+            self.session.close()
+            self.session = None
+
+
+class StepProfiler(WallProfiler):
+    """Read native copy/replay events and disjoint host processing times."""
+
+    flags = 7
+
+    def __init__(self, model, cudart=None, *, clock=time.perf_counter_ns, detailed=False):
+        super().__init__(model, clock=clock)
+        self.detailed = detailed
 
 
 class WaitProfiler(WallProfiler):
-    """Measure D2H and completion-wait CPU/wall clocks without adding timing events."""
+    """Read copy/wait CPU times and real polling without timing events."""
 
-    def __init__(self, model, cudart):
+    flags = 5
+
+    def __init__(self, model, cudart=None):
         super().__init__(model)
-        self.cu = cudart
-        self.stack = ExitStack()
-        self.in_wait = False
-
-    def __enter__(self):
-        from unittest.mock import patch
-
-        from listenflow.fastest_whisper import _inference
-        from listenflow.fastest_whisper._inference import _HostIO
-
-        super().__enter__()
-        self.stack.callback(super().__exit__, None, None, None)
-        original_run = _HostIO.run
-
-        def run(io, inputs, **kwargs):
-            measured = self.active and io is self.model._decoder
-            if measured:
-                self.wait_cpu = self.wait_wall = 0
-                self.query_count = 0
-                self.sleep_durations = []
-                self.wait_details = dict.fromkeys(
-                    ("copy_cpu_ns", "copy_wall_ns", "sync_cpu_ns", "sync_wall_ns"), 0
-                )
-            outputs = original_run(io, inputs, **kwargs)
-            if measured:
-                self.rows[-1].update(
-                    wait_cpu_ns=self.wait_cpu,
-                    wait_wall_ns=self.wait_wall,
-                    query_count=self.query_count,
-                    sleep_ns=json.dumps(self.sleep_durations),
-                    **self.wait_details,
-                )
-            return outputs
-
-        def wrap(function, is_copy):
-            def call(*args):
-                measured = self.active and (
-                    not is_copy or args[3] == self.cu.cudaMemcpyKind.cudaMemcpyDeviceToHost
-                )
-                if not measured:
-                    return function(*args)
-                cpu, wall = time.thread_time_ns(), time.perf_counter_ns()
-                if not is_copy:
-                    self.in_wait = True
-                try:
-                    return function(*args)
-                finally:
-                    self.in_wait = False
-                    cpu_elapsed = time.thread_time_ns() - cpu
-                    wall_elapsed = time.perf_counter_ns() - wall
-                    self.wait_cpu += cpu_elapsed
-                    self.wait_wall += wall_elapsed
-                    section = "copy" if is_copy else "sync"
-                    self.wait_details[f"{section}_cpu_ns"] += cpu_elapsed
-                    self.wait_details[f"{section}_wall_ns"] += wall_elapsed
-
-            return call
-
-        original_query = self.cu.cudaEventQuery
-
-        def query(*args):
-            if self.active and self.in_wait:
-                self.query_count += 1
-            return original_query(*args)
-
-        original_sleep = getattr(_inference, "sleep", None)
-
-        def sleep(interval):
-            if not self.active or not self.in_wait:
-                return original_sleep(interval)
-            started = time.perf_counter_ns()
-            try:
-                return original_sleep(interval)
-            finally:
-                self.sleep_durations.append(time.perf_counter_ns() - started)
-
-        self.stack.enter_context(patch.object(_HostIO, "run", run))
-        self.stack.enter_context(patch.object(self.cu, "cudaEventQuery", query))
-        if original_sleep is not None:
-            self.stack.enter_context(patch.object(_inference, "sleep", sleep))
-        for name, is_copy in (("cudaMemcpyAsync", True), ("cudaStreamSynchronize", False)):
-            self.stack.enter_context(
-                patch.object(self.cu, name, wrap(getattr(self.cu, name), is_copy))
-            )
-        if hasattr(_HostIO, "_wait"):
-            self.stack.enter_context(patch.object(_HostIO, "_wait", wrap(_HostIO._wait, False)))
-        return self
-
-    def __exit__(self, *_exc):
-        self.active = False
-        self.stack.close()

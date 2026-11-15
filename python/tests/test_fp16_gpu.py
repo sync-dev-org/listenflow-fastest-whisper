@@ -30,6 +30,22 @@ def test_fp16_entry_transcribes_a_supplied_waveform_with_a_supplied_checkpoint()
 
 
 @pytest.mark.gpu
+@pytest.mark.req("SP-LFFASTESTWHISPER-004")
+@pytest.mark.req("SP-LFFASTESTWHISPER-019")
+def test_fp16_english_greedy_entry_transcribes_once():
+    """One greedy fp16 decode of English speech returns text without preparing retry batches."""
+    checkpoint = os.environ.get("LFFW_CHECKPOINT_DIR")
+    if os.environ.get("LFFW_USE_GPU") != "1" or not checkpoint:
+        pytest.skip("set LFFW_USE_GPU=1 and LFFW_CHECKPOINT_DIR to run GPU comparisons")
+    samples = read_pcm16_mono(Path(__file__).parent / "fixtures/small_boat_16khz_mono_s16le.wav")
+    result = transcribe_fp16(
+        Path(checkpoint), samples, temperature=0.0, best_of=1, no_speech_threshold=None
+    )
+    assert "boat" in result.text.lower()
+    assert result.tokens
+
+
+@pytest.mark.gpu
 @pytest.mark.req("SP-LFFASTESTWHISPER-001")
 def test_fp16_model_runs_beam_and_sampled_settings_from_one_loaded_checkpoint():
     """Both selected fp16 decode modes finish on the same loaded model without a quality gate."""

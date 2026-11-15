@@ -15,17 +15,20 @@ def sampled_model(rows, *, context=16):
     remaining = iter(rows)
 
     class NativeDecoder:
-        def run(self, inputs, *, device_outputs, reuse_cache):
-            calls.append({name: value.copy() for name, value in inputs.items()})
-            assert reuse_cache
-            assert "logits" in device_outputs
-            result = next(remaining)
-            return {
-                "sampled": np.asarray(result, dtype=np.float32).reshape(2, 1, 3),
-                "logits": np.zeros((2, 1, 6), np.float32),
-                "present_keys": inputs["self_keys"],
-                "present_values": inputs["self_values"],
+        def sampled_step(self, tokens, suppression, temperature, uniform, timestamps):
+            inputs = {
+                "tokens": tokens[:, None],
+                "suppression": suppression[:, None],
+                "uniform": uniform[:, None, None],
+                "temperature": np.array([temperature]),
+                "timestamps": np.array([timestamps]),
             }
+            calls.append({name: value.copy() for name, value in inputs.items()})
+            result = np.asarray(next(remaining), dtype=np.float32).reshape(2, 3)
+            return result[:, 0].astype(np.int32), result[:, 1], result[:, 2]
+
+        def close(self):
+            pass
 
     model = TensorRTWhisper.__new__(TensorRTWhisper)
     model.config = SimpleNamespace(
@@ -39,7 +42,7 @@ def sampled_model(rows, *, context=16):
     model._sampled_decoder = NativeDecoder()
     model._sampled_batch = 2
     model.tokenizer = SimpleNamespace(token_to_id={"<|nospeech|>": 5}.get)
-    encoder = SimpleNamespace(tensors={"cross_keys": np.zeros(1), "cross_values": np.zeros(1)})
+    encoder = SimpleNamespace(decoder=lambda kind, batch: model._sampled_decoder)
     return model, encoder, calls
 
 
